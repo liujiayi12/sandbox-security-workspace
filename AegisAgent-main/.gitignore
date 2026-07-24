@@ -1,0 +1,31 @@
+.sandbox_data/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+runs.sqlite3
+
+# Local sample/research archives and expanded third-party repositories.
+real_samples/
+research_repos/
+
+# Public repository keeps only lightweight evaluation examples. Local
+# benchmark/CVE manifests may reference private sample folders under
+# real_samples and should not be uploaded by default.
+eval_cases/*.json
+!eval_cases/examples.json
+!eval_cases/README.md
+
+# Local historical worktrees kept outside the public repository history.
+sandbox_1.0/
+sandbox_2.0/
+
+# Local notes that point at machine-specific run directories.
+docs/adaptation_optimization_rounds.md

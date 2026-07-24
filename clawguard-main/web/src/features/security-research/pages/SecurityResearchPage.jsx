@@ -1,0 +1,820 @@
+import { useEffect, useMemo, useState } from "react";
+import {
+  BookOpen,
+  ChevronLeft,
+  ChevronRight,
+  ExternalLink,
+  Heart,
+  MessageCircle,
+  RefreshCw,
+  Search,
+  Send,
+  Sparkles,
+  Zap,
+} from "lucide-react";
+import { PAGE_SIZE_OPTIONS } from "../../../config.js";
+import {
+  fetchSecurityResearchOverview,
+  fetchSecurityResearchPapers,
+  triggerSecurityResearchRefresh,
+} from "../services/dataService.js";
+import {
+  createSecurityResearchComment,
+  loadSecurityResearchDiscussion,
+  replySecurityResearchComment,
+  toggleSecurityResearchCommentLike,
+} from "../services/discussionService.js";
+
+const SOURCE_TYPE_OPTIONS = [
+  { label: "全部来源", value: "" },
+  { label: "顶会论文", value: "conference_paper" },
+  { label: "预印本", value: "preprint" },
+];
+
+const SORT_OPTIONS = [
+  { label: "时间倒序", value: "published_desc" },
+  { label: "时间正序", value: "published_asc" },
+  { label: "相关性优先", value: "relevance_desc" },
+];
+
+function formatDate(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toISOString().slice(0, 10);
+}
+
+function compactSummary(value = "", maxLength = 220) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "-";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength).trim()}...`;
+}
+
+function formatRelativeTime(value) {
+  if (!value) return "-";
+  const timestamp = new Date(value).getTime();
+  if (Number.isNaN(timestamp)) return "-";
+
+  const diffMinutes = Math.max(1, Math.round((Date.now() - timestamp) / 60000));
+  if (diffMinutes < 60) return `${diffMinutes} 分钟前`;
+
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours} 小时前`;
+
+  const diffDays = Math.round(diffHours / 24);
+  if (diffDays < 30) return `${diffDays} 天前`;
+
+  return formatDate(value);
+}
+
+function Badge({ tone = "neutral", children }) {
+  return <span className={`research-badge research-badge-${tone}`}>{children}</span>;
+}
+
+function SourceTypeBadge({ sourceType, isTopVenue }) {
+  if (sourceType === "conference_paper" || isTopVenue) {
+    return <Badge tone="top">顶会</Badge>;
+  }
+  return <Badge tone="preprint">预印本</Badge>;
+}
+
+function Pager({ page, pageSize, total, onPage, onPageSize }) {
+  const totalPages = Math.max(1, Math.ceil(Math.max(total, 1) / pageSize));
+  const canPrev = page > 1;
+  const canNext = page < totalPages;
+
+  const pageNums = useMemo(() => {
+    if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1);
+    const nums = new Set([1, totalPages, page]);
+    for (let delta = -2; delta <= 2; delta += 1) {
+      const next = page + delta;
+      if (next >= 1 && next <= totalPages) nums.add(next);
+    }
+    return Array.from(nums).sort((a, b) => a - b);
+  }, [page, totalPages]);
+
+  return (
+    <div className="research-pager">
+      <span className="research-pager-info">
+        共 {total.toLocaleString("zh-CN")} 条，当前第 {page} / {totalPages} 页
+      </span>
+      <div className="research-pager-actions">
+        <button type="button" className="research-pager-btn" disabled={!canPrev} onClick={() => onPage(page - 1)}>
+          <ChevronLeft size={14} />
+        </button>
+        {pageNums.map((pageNum, index) => {
+          const prev = pageNums[index - 1];
+          const hasGap = prev && pageNum - prev > 1;
+          return (
+            <span key={pageNum} className="research-pager-seq">
+              {hasGap ? <span className="research-pager-ellipsis">...</span> : null}
+              <button
+                type="button"
+                className={`research-pager-btn${pageNum === page ? " is-active" : ""}`}
+                onClick={() => onPage(pageNum)}
+              >
+                {pageNum}
+              </button>
+            </span>
+          );
+        })}
+        <button type="button" className="research-pager-btn" disabled={!canNext} onClick={() => onPage(page + 1)}>
+          <ChevronRight size={14} />
+        </button>
+        <select className="research-select" value={pageSize} onChange={(event) => onPageSize(Number(event.target.value))}>
+          {PAGE_SIZE_OPTIONS.map((size) => (
+            <option key={size} value={size}>
+              {size} / 页
+            </option>
+          ))}
+        </select>
+      </div>
+    </div>
+  );
+}
+
+function HighlightCard({ paper }) {
+  return (
+    <article className="research-highlight-card">
+      <div className="research-highlight-top">
+        <div className="research-highlight-badges">
+          <SourceTypeBadge sourceType={paper.sourceType} isTopVenue={paper.isTopVenue} />
+          <Badge tone="venue">{paper.venue}</Badge>
+        </div>
+        <span className="research-highlight-date">{formatDate(paper.publishedAt)}</span>
+      </div>
+      <h3 className="research-highlight-title">{paper.title}</h3>
+      <p className="research-highlight-summary" title={paper.abstractOrSummary}>
+        {compactSummary(paper.abstractOrSummary, 200)}
+      </p>
+      <div className="research-highlight-meta">
+        <span>{paper.projectScope}</span>
+        <span>相关度 {paper.relevanceScore}</span>
+      </div>
+    </article>
+  );
+}
+
+function FilterField({ id, label, children }) {
+  return (
+    <label className="research-filter-field" htmlFor={id}>
+      <span className="research-filter-label">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function DiscussionComposer({ auth, value, onChange, onSubmit, submitting }) {
+  const isLoggedIn = Boolean(auth?.isLoggedIn);
+
+  return (
+    <div className="research-discussion-composer">
+      <div className="research-discussion-composer-top">
+        <div>
+          <div className="research-discussion-title">发表评论</div>
+          <div className="research-discussion-hint">
+            {isLoggedIn
+              ? `以 ${auth.user?.username || "guest"} 身份参与讨论，分享对论文、方向或方法的看法。`
+              : "登录后可在平台发表评论、点赞与回复。"}
+          </div>
+        </div>
+        <div className="research-discussion-author">
+          <span>{isLoggedIn ? auth.user?.username : "未登录"}</span>
+        </div>
+      </div>
+
+      <textarea
+        className="research-discussion-textarea"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={isLoggedIn ? "输入你的观点、补充线索或风险判断..." : "请先登录后参与讨论"}
+        disabled={!isLoggedIn || submitting}
+      />
+
+      <div className="research-discussion-actions">
+        <span className="research-discussion-count">{value.trim().length}/500</span>
+        <button
+          type="button"
+          className="oc-primary-btn"
+          onClick={onSubmit}
+          disabled={!isLoggedIn || submitting || !value.trim()}
+        >
+          <Send size={14} />
+          <span>{submitting ? "发布中..." : "发布评论"}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DiscussionReplyComposer({ value, onChange, onSubmit, onCancel, disabled }) {
+  return (
+    <div className="research-reply-composer">
+      <textarea
+        className="research-discussion-textarea is-reply"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="写下你的回复..."
+        disabled={disabled}
+      />
+      <div className="research-reply-actions">
+        <button type="button" className="utility-ghost-btn" onClick={onCancel}>
+          取消
+        </button>
+        <button type="button" className="oc-primary-btn" onClick={onSubmit} disabled={disabled || !value.trim()}>
+          <Send size={14} />
+          <span>回复</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DiscussionCard({
+  comment,
+  auth,
+  replyDraft,
+  replyOpen,
+  onToggleLike,
+  onOpenReply,
+  onReplyDraftChange,
+  onSubmitReply,
+  onCancelReply,
+}) {
+  const currentUser = String(auth?.user?.username || "").trim().toLowerCase();
+  const isLoggedIn = Boolean(auth?.isLoggedIn);
+  const commentLiked = currentUser ? comment.likes.includes(currentUser) : false;
+
+  return (
+    <article className="research-discussion-card">
+      <div className="research-discussion-card-head">
+        <div className="research-discussion-avatar">{comment.author.slice(0, 1).toUpperCase()}</div>
+        <div className="research-discussion-meta">
+          <strong>{comment.author}</strong>
+          <span>{formatRelativeTime(comment.createdAt)}</span>
+        </div>
+      </div>
+
+      <p className="research-discussion-content">{comment.content}</p>
+
+      <div className="research-discussion-toolbar">
+        <button
+          type="button"
+          className={`research-discussion-btn${commentLiked ? " is-active" : ""}`}
+          onClick={() => onToggleLike(comment.id)}
+          disabled={!isLoggedIn}
+        >
+          <Heart size={14} />
+          <span>点赞 {comment.likes.length}</span>
+        </button>
+        <button
+          type="button"
+          className={`research-discussion-btn${replyOpen ? " is-active" : ""}`}
+          onClick={() => onOpenReply(comment.id)}
+          disabled={!isLoggedIn}
+        >
+          <MessageCircle size={14} />
+          <span>回复 {comment.replies.length}</span>
+        </button>
+      </div>
+
+      {replyOpen ? (
+        <DiscussionReplyComposer
+          value={replyDraft}
+          onChange={onReplyDraftChange}
+          onSubmit={() => onSubmitReply(comment.id)}
+          onCancel={onCancelReply}
+          disabled={!isLoggedIn}
+        />
+      ) : null}
+
+      {comment.replies.length ? (
+        <div className="research-reply-list">
+          {comment.replies.map((reply) => {
+            const replyLiked = currentUser ? reply.likes.includes(currentUser) : false;
+            return (
+              <div key={reply.id} className="research-reply-card">
+                <div className="research-discussion-card-head is-reply">
+                  <div className="research-discussion-avatar is-reply">{reply.author.slice(0, 1).toUpperCase()}</div>
+                  <div className="research-discussion-meta">
+                    <strong>{reply.author}</strong>
+                    <span>{formatRelativeTime(reply.createdAt)}</span>
+                  </div>
+                </div>
+                <p className="research-discussion-content is-reply">{reply.content}</p>
+                <button
+                  type="button"
+                  className={`research-discussion-btn is-inline${replyLiked ? " is-active" : ""}`}
+                  onClick={() => onToggleLike(comment.id, reply.id)}
+                  disabled={!isLoggedIn}
+                >
+                  <Heart size={13} />
+                  <span>点赞 {reply.likes.length}</span>
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+export default function SecurityResearchPage({ auth }) {
+  const [overview, setOverview] = useState(null);
+  const [overviewLoading, setOverviewLoading] = useState(true);
+  const [overviewError, setOverviewError] = useState("");
+  const [papersData, setPapersData] = useState(null);
+  const [papersLoading, setPapersLoading] = useState(true);
+  const [papersError, setPapersError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [discussion, setDiscussion] = useState([]);
+  const [commentDraft, setCommentDraft] = useState("");
+  const [activeReplyId, setActiveReplyId] = useState("");
+  const [replyDrafts, setReplyDrafts] = useState({});
+  const [filters, setFilters] = useState({
+    page: 1,
+    pageSize: PAGE_SIZE_OPTIONS[0],
+    sourceType: "",
+    venue: "",
+    projectScope: "",
+    keyword: "",
+    sort: "published_desc",
+  });
+
+  async function loadOverview() {
+    setOverviewLoading(true);
+    setOverviewError("");
+    try {
+      const data = await fetchSecurityResearchOverview();
+      setOverview(data);
+    } catch (error) {
+      setOverviewError(error.message || "加载失败");
+    } finally {
+      setOverviewLoading(false);
+    }
+  }
+
+  async function loadPapers() {
+    setPapersLoading(true);
+    setPapersError("");
+    try {
+      const data = await fetchSecurityResearchPapers({
+        page: filters.page,
+        page_size: filters.pageSize,
+        source_type: filters.sourceType,
+        venue: filters.venue,
+        project_scope: filters.projectScope,
+        keyword: filters.keyword,
+        sort: filters.sort,
+      });
+      setPapersData(data);
+    } catch (error) {
+      setPapersError(error.message || "加载失败");
+    } finally {
+      setPapersLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadOverview();
+  }, []);
+
+  useEffect(() => {
+    setDiscussion(loadSecurityResearchDiscussion());
+  }, []);
+
+  useEffect(() => {
+    void loadPapers();
+  }, [filters.page, filters.pageSize, filters.sourceType, filters.venue, filters.projectScope, filters.keyword, filters.sort]);
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    try {
+      await triggerSecurityResearchRefresh();
+      await Promise.all([loadOverview(), loadPapers()]);
+    } catch (error) {
+      setOverviewError(error.message || "刷新失败");
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  const venues = papersData?.filterOptions?.venues || [];
+  const projectScopes = papersData?.filterOptions?.projectScopes || [];
+  const totals = overview?.totals;
+  const sourceMeta = overview?.sourceMeta;
+  const scheduler = sourceMeta?.scheduler;
+  const keywords = sourceMeta?.keywords || [];
+  const latestPapers = overview?.latest || [];
+  const totalReplyCount = discussion.reduce((sum, item) => sum + item.replies.length, 0);
+
+  function handleSubmitComment() {
+    if (!auth?.isLoggedIn) return;
+    const next = createSecurityResearchComment({
+      author: auth.user?.username || "guest",
+      content: commentDraft.slice(0, 500),
+    });
+    setDiscussion(next);
+    setCommentDraft("");
+  }
+
+  function handleToggleLike(commentId, replyId = "") {
+    if (!auth?.isLoggedIn) return;
+    const next = toggleSecurityResearchCommentLike({
+      commentId,
+      replyId,
+      username: auth.user?.username || "",
+    });
+    setDiscussion(next);
+  }
+
+  function handleSubmitReply(commentId) {
+    if (!auth?.isLoggedIn) return;
+    const next = replySecurityResearchComment({
+      commentId,
+      author: auth.user?.username || "guest",
+      content: replyDrafts[commentId] || "",
+    });
+    setDiscussion(next);
+    setReplyDrafts((prev) => ({ ...prev, [commentId]: "" }));
+    setActiveReplyId("");
+  }
+
+  return (
+    <div className="oc-page research-page">
+      <section className="research-hero">
+        <div className="research-hero-main">
+          <div className="oc-page-tag">学术安全前沿</div>
+          <h2 className="oc-page-title">安全研究前沿</h2>
+          <p className="oc-page-desc">
+            围绕 OpenClaw、Claw、Skill、Plugin 与 Agent 生态，集中展示近期更值得关注的安全论文、预印本与研究主题，
+            帮助快速把握值得跟进的方向。
+          </p>
+
+          <div className="research-toolbar">
+            <button type="button" className="oc-primary-btn" disabled={refreshing} onClick={handleRefresh}>
+              <RefreshCw size={14} />
+              <span>{refreshing ? "更新中..." : "立即更新"}</span>
+            </button>
+            <span className="research-toolbar-meta">最近同步：{sourceMeta?.lastSyncedAt || "-"}</span>
+            <span className="research-toolbar-meta">自动更新周期：{scheduler?.intervalDays || 7} 天</span>
+          </div>
+
+          <div className="research-keyword-cloud">
+            {keywords.map((keyword) => (
+              <button
+                key={keyword}
+                type="button"
+                className={`research-keyword-chip${filters.keyword === keyword ? " is-active" : ""}`}
+                onClick={() => setFilters((prev) => ({ ...prev, page: 1, keyword }))}
+              >
+                {keyword}
+              </button>
+            ))}
+          </div>
+
+          <div className="research-live-note" aria-live="polite">
+            {overviewError || papersError || "优先从重点研究开始浏览，再用下方筛选器按会议、范围和关键词继续收窄。"}
+          </div>
+        </div>
+
+        <div className="research-kpi-grid">
+          <div className="research-kpi-card">
+            <strong>{overviewLoading ? "--" : totals?.totalPapers ?? 0}</strong>
+            <span>论文总量</span>
+          </div>
+          <div className="research-kpi-card">
+            <strong>{overviewLoading ? "--" : totals?.conferencePaperCount ?? 0}</strong>
+            <span>顶会论文</span>
+          </div>
+          <div className="research-kpi-card">
+            <strong>{overviewLoading ? "--" : totals?.preprintCount ?? 0}</strong>
+            <span>预印本</span>
+          </div>
+          <div className="research-kpi-card">
+            <strong>{overviewLoading ? "--" : totals?.agent ?? 0}</strong>
+            <span>Agent 相关</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="research-panel">
+        <div className="research-panel-header">
+          <h3>重点研究</h3>
+          <span>优先展示更值得先读的论文，兼顾会议质量、相关性与时间新鲜度</span>
+        </div>
+        <div className="research-highlight-grid">
+          {(overview?.featured || []).map((paper) => (
+            <HighlightCard key={paper.id} paper={paper} />
+          ))}
+          {!overviewLoading && !(overview?.featured || []).length ? <div className="research-empty">暂无重点研究数据。</div> : null}
+        </div>
+      </section>
+
+      <section className="research-panel">
+        <div className="research-panel-header">
+          <h3>研究概览</h3>
+          <span>从研究范围、会议来源和最新入库三个角度快速判断当前关注重点</span>
+        </div>
+
+        <div className="research-analysis-grid">
+          <div className="research-analysis-card">
+            <div className="research-analysis-title">范围分布</div>
+            <div className="research-chip-row">
+              <Badge tone="scope">openclaw {totals?.openclaw ?? 0}</Badge>
+              <Badge tone="scope">claw {totals?.claw ?? 0}</Badge>
+              <Badge tone="scope">skill {totals?.skill ?? 0}</Badge>
+              <Badge tone="scope">agent {totals?.agent ?? 0}</Badge>
+              <Badge tone="scope">plugin {totals?.plugin ?? 0}</Badge>
+            </div>
+            <div className="research-mini-bars">
+              {[
+                ["OpenClaw", totals?.openclaw ?? 0],
+                ["Claw", totals?.claw ?? 0],
+                ["Skill", totals?.skill ?? 0],
+                ["Agent", totals?.agent ?? 0],
+                ["Plugin", totals?.plugin ?? 0],
+              ].map(([label, value]) => {
+                const maxValue = Math.max(
+                  totals?.openclaw ?? 0,
+                  totals?.claw ?? 0,
+                  totals?.skill ?? 0,
+                  totals?.agent ?? 0,
+                  totals?.plugin ?? 0,
+                  1,
+                );
+                const width = `${Math.max(10, Math.round((Number(value) / maxValue) * 100))}%`;
+                return (
+                  <div key={label} className="research-mini-bar-row">
+                    <span>{label}</span>
+                    <div className="research-mini-bar-track">
+                      <div className="research-mini-bar-fill" style={{ width }} />
+                    </div>
+                    <strong>{value}</strong>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="research-analysis-card">
+            <div className="research-analysis-title">会议分布</div>
+            <div className="research-chip-row">
+              {(overview?.venues || []).map((item) => (
+                <Badge key={item.venue} tone="venue">
+                  {item.venue} {item.count}
+                </Badge>
+              ))}
+            </div>
+            <div className="research-venue-list">
+              {(overview?.venues || []).map((item) => (
+                <div key={`venue-${item.venue}`} className="research-venue-item">
+                  <span>{item.venue}</span>
+                  <strong>{item.count}</strong>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="research-analysis-card">
+            <div className="research-analysis-title">最新入库</div>
+            <div className="research-latest-list">
+              {latestPapers.slice(0, 5).map((paper) => (
+                <div key={paper.id} className="research-latest-item">
+                  <div className="research-latest-icon">
+                    {paper.sourceType === "conference_paper" ? <Sparkles size={14} /> : <BookOpen size={14} />}
+                  </div>
+                  <div className="research-latest-copy">
+                    <strong>{paper.title}</strong>
+                    <span>
+                      {paper.venue} · {formatDate(paper.publishedAt)}
+                    </span>
+                  </div>
+                </div>
+              ))}
+              {!latestPapers.length ? <div className="research-empty">暂无最新动态。</div> : null}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="research-panel">
+        <div className="research-panel-header">
+          <h3>论文列表</h3>
+          <span>支持按来源、会议、范围和关键词筛选，适合继续深入查阅</span>
+        </div>
+
+        <div className="research-filter-bar">
+          <FilterField id="research-source-type" label="来源类型">
+            <select
+              id="research-source-type"
+              className="research-select"
+              value={filters.sourceType}
+              onChange={(event) => setFilters((prev) => ({ ...prev, page: 1, sourceType: event.target.value }))}
+            >
+              {SOURCE_TYPE_OPTIONS.map((option) => (
+                <option key={option.value || "all-source"} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </FilterField>
+
+          <FilterField id="research-venue" label="会议 / 来源">
+            <select
+              id="research-venue"
+              className="research-select"
+              value={filters.venue}
+              onChange={(event) => setFilters((prev) => ({ ...prev, page: 1, venue: event.target.value }))}
+            >
+              <option value="">全部会议</option>
+              {venues.map((venue) => (
+                <option key={venue} value={venue}>
+                  {venue}
+                </option>
+              ))}
+            </select>
+          </FilterField>
+
+          <FilterField id="research-scope" label="项目范围">
+            <select
+              id="research-scope"
+              className="research-select"
+              value={filters.projectScope}
+              onChange={(event) => setFilters((prev) => ({ ...prev, page: 1, projectScope: event.target.value }))}
+            >
+              <option value="">全部范围</option>
+              {projectScopes.map((scope) => (
+                <option key={scope} value={scope}>
+                  {scope}
+                </option>
+              ))}
+            </select>
+          </FilterField>
+
+          <FilterField id="research-sort" label="排序方式">
+            <select
+              id="research-sort"
+              className="research-select"
+              value={filters.sort}
+              onChange={(event) => setFilters((prev) => ({ ...prev, page: 1, sort: event.target.value }))}
+            >
+              {SORT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </FilterField>
+
+          <FilterField id="research-keyword" label="关键词">
+            <div className="research-search-wrap">
+              <Search size={15} className="research-search-icon" />
+              <input
+                id="research-keyword"
+                className="research-input research-input-search"
+                placeholder="搜索标题 / 摘要 / 标签"
+                value={filters.keyword}
+                onChange={(event) => setFilters((prev) => ({ ...prev, page: 1, keyword: event.target.value }))}
+              />
+            </div>
+          </FilterField>
+        </div>
+
+        {papersError ? <div className="research-error">{papersError}</div> : null}
+
+        <div className="research-table-wrap">
+          <table className="research-table">
+            <thead>
+              <tr>
+                <th>论文</th>
+                <th>来源</th>
+                <th>范围</th>
+                <th>时间</th>
+                <th>标签</th>
+                <th>链接</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(papersData?.rows || []).map((paper) => (
+                <tr key={paper.id}>
+                  <td>
+                    <div className="research-paper-title">{paper.title}</div>
+                    <div className="research-paper-summary" title={paper.abstractOrSummary}>
+                      {compactSummary(paper.abstractOrSummary, 260)}
+                    </div>
+                    <div className="research-paper-authors">{(paper.authors || []).join(", ") || "-"}</div>
+                  </td>
+                  <td>
+                    <div className="research-chip-row">
+                      <SourceTypeBadge sourceType={paper.sourceType} isTopVenue={paper.isTopVenue} />
+                      <Badge tone="venue">{paper.venue}</Badge>
+                      {paper.sourcePrimary ? <Badge tone="tag">{paper.sourcePrimary}</Badge> : null}
+                    </div>
+                  </td>
+                  <td>
+                    <Badge tone="scope">{paper.projectScope}</Badge>
+                  </td>
+                  <td>{formatDate(paper.publishedAt)}</td>
+                  <td>
+                    <div className="research-chip-row">
+                      {(paper.tags || []).slice(0, 6).map((tag) => (
+                        <Badge key={`${paper.id}-${tag}`} tone="tag">
+                          {tag}
+                        </Badge>
+                      ))}
+                    </div>
+                  </td>
+                  <td>
+                    {paper.sourceUrl ? (
+                      <a className="research-link" href={paper.sourceUrl} target="_blank" rel="noreferrer">
+                        <ExternalLink size={14} />
+                        <span>查看</span>
+                      </a>
+                    ) : (
+                      "-"
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {papersLoading ? <div className="research-empty">论文列表加载中...</div> : null}
+          {!papersLoading && !(papersData?.rows || []).length ? <div className="research-empty">当前筛选条件下暂无结果。</div> : null}
+        </div>
+
+        {!papersLoading && (papersData?.total ?? 0) > 0 ? (
+          <Pager
+            page={filters.page}
+            pageSize={filters.pageSize}
+            total={papersData?.total ?? 0}
+            onPage={(nextPage) => setFilters((prev) => ({ ...prev, page: nextPage }))}
+            onPageSize={(nextPageSize) => setFilters((prev) => ({ ...prev, page: 1, pageSize: nextPageSize }))}
+          />
+        ) : null}
+      </section>
+
+      <section className="research-panel">
+        <div className="research-panel-header">
+          <h3>讨论区</h3>
+          <span>围绕论文观点、技术路线与安全判断展开交流，登录后即可评论、点赞与回复。</span>
+        </div>
+
+        <div className="research-discussion-overview">
+          <div className="research-discussion-stat">
+            <span>评论总数</span>
+            <strong>{discussion.length}</strong>
+          </div>
+          <div className="research-discussion-stat">
+            <span>回复总数</span>
+            <strong>{totalReplyCount}</strong>
+          </div>
+          <div className="research-discussion-stat">
+            <span>当前状态</span>
+            <strong>{auth?.isLoggedIn ? "已登录" : "游客"}</strong>
+          </div>
+        </div>
+
+        <DiscussionComposer
+          auth={auth}
+          value={commentDraft}
+          onChange={setCommentDraft}
+          onSubmit={handleSubmitComment}
+          submitting={false}
+        />
+
+        <div className="research-discussion-list">
+          {discussion.map((comment) => (
+            <DiscussionCard
+              key={comment.id}
+              comment={comment}
+              auth={auth}
+              replyDraft={replyDrafts[comment.id] || ""}
+              replyOpen={activeReplyId === comment.id}
+              onToggleLike={handleToggleLike}
+              onOpenReply={(commentId) => setActiveReplyId((prev) => (prev === commentId ? "" : commentId))}
+              onReplyDraftChange={(value) => setReplyDrafts((prev) => ({ ...prev, [comment.id]: value.slice(0, 300) }))}
+              onSubmitReply={handleSubmitReply}
+              onCancelReply={() => setActiveReplyId("")}
+            />
+          ))}
+          {!discussion.length ? (
+            <div className="research-empty">暂无讨论内容。登录后可以成为第一个发表评论的人。</div>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="research-panel research-panel-footnote">
+        <div className="research-footnote">
+          <Zap size={16} />
+          <span>
+            当前学术页已打通 `Crossref`、`DBLP`、`arXiv`。`Google Scholar`
+            未做直接抓取，如需接入建议使用合规检索服务或人工导入管线接到现有标准化流程。
+          </span>
+        </div>
+      </section>
+    </div>
+  );
+}

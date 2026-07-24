@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AegisAgent</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>AegisAgent</h1>
+            <p>上传智能体压缩包，配置可选模型能力，运行静态扫描、动态攻击测试与受控环境验证。</p>
+          </div>
+          <a class="docs-link" href="/docs">API Docs</a>
+        </header>
+
+        <div class="content-grid">
+          <div class="left-column">
+            <form id="run-form" class="panel" autocomplete="off">
+              <div class="section-head">
+                <h2>测试配置</h2>
+                <span id="key-state" class="pill">未提供 API KEY</span>
+              </div>
+
+              <label class="file-drop" for="agent-file" id="drop-zone">
+                <input id="agent-file" name="file" type="file" accept=".zip,application/zip" required />
+                <span class="file-title" id="file-title">选择智能体压缩包</span>
+                <span class="file-meta" id="file-meta">仅支持 .zip 文件</span>
+              </label>
+
+              <div class="form-grid">
+                <label>
+                  <span>API 厂商</span>
+                  <select id="provider">
+                    <option value="none">无</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="deepseek">DeepSeek</option>
+                    <option value="siliconflow">硅基流动</option>
+                    <option value="custom">OpenAI-compatible</option>
+                  </select>
+                </label>
+
+                <label>
+                  <span>模型</span>
+                  <input id="model" type="text" placeholder="选择厂商后自动填入，可修改" />
+                </label>
+              </div>
+
+              <label>
+                <span>Base URL</span>
+                <input id="base-url" type="url" placeholder="https://api.example.com/v1" />
+              </label>
+
+              <label>
+                <span>API KEY</span>
+                <div class="secret-row">
+                  <input id="api-key" type="password" placeholder="不提供时将使用沙箱 fake environment" />
+                  <button id="toggle-key" class="icon-button" type="button" aria-label="显示或隐藏 API KEY" title="显示或隐藏 API KEY">•••</button>
+                </div>
+              </label>
+
+              <p id="no-key-warning" class="notice">
+                当前未提供 API KEY。沙箱仍会执行静态扫描和 fake environment 动态测试，但依赖真实模型服务的智能体可能无法完成对话。
+              </p>
+
+              <fieldset id="llm-options" class="checks" disabled>
+                <legend>大模型辅助</legend>
+                <label><input type="checkbox" id="llm-audit" checked /> 辅助静态扫描</label>
+                <label><input type="checkbox" id="llm-build" checked /> 辅助智能体搭建</label>
+                <label><input type="checkbox" id="llm-attack" checked /> 辅助动态分析</label>
+              </fieldset>
+
+              <div class="advanced-row">
+                <label>
+                  <span>网络策略</span>
+                  <select id="runtime-network">
+                    <option value="auto">自动</option>
+                    <option value="sandbox">私有 fake network</option>
+                    <option value="none">完全断网</option>
+                    <option value="bridge">允许公网</option>
+                  </select>
+                </label>
+                <label>
+                  <span>构建策略</span>
+                  <select id="build-mode">
+                    <option value="auto">自动</option>
+                    <option value="strict">严格</option>
+                    <option value="sandbox_yaml_only">仅 sandbox.yaml</option>
+                  </select>
+                </label>
+              </div>
+
+              <fieldset class="checks">
+                <legend>Docker 镜像保留策略</legend>
+                <label><input type="checkbox" id="delete-build-image" checked /> 测试结束后删除一级构建镜像</label>
+                <p class="hint">仅删除 <code>agent-sandbox-build:*</code>，不会删除 <code>aegisagent-*</code> 二级基础镜像。</p>
+              </fieldset>
+
+              <button id="submit-run" class="primary-button" type="submit">开始测试</button>
+            </form>
+
+            <section class="panel reserve-panel">
+              <div class="section-head">
+                <h2>镜像储备状态</h2>
+                <button id="refresh-reserve" class="secondary-button compact-button" type="button">刷新</button>
+              </div>
+              <div id="image-reserve" class="reserve-status muted">正在读取本地镜像储备状态...</div>
+            </section>
+          </div>
+
+          <section class="panel result-panel" aria-live="polite">
+            <div class="section-head">
+              <h2>测试结果</h2>
+              <button id="download-report" class="secondary-button" type="button" disabled>下载 Markdown 报告</button>
+            </div>
+
+            <div id="empty-state" class="empty-state">
+              等待上传任务。测试结束后，面向用户的 Markdown 报告会直接显示在这里。
+            </div>
+
+            <div id="run-status" class="status-list hidden"></div>
+            <div id="report-view" class="report-view hidden"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

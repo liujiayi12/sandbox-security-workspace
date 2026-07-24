@@ -1,0 +1,52 @@
+# Local environments and dependency folders
+**/.venv/
+**/.venv*/
+**/node_modules/
+**/.npm-cache/
+/tools/
+
+# Build outputs and generated runtime data
+**/dist/
+**/build/
+**/.sandbox_data/
+**/runtime-cache/
+**/artifacts/
+**/Log/
+**/logs/
+**/web/generated/
+**/web/public/data/
+**/web/clawdbot_alive/
+**/web/geoip/
+**/*.mmdb
+**/*.sqlite3
+**/*.db
+
+# Secrets and local machine configuration
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python / test caches
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+.coverage
+htmlcov/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+*.bak
+*.bak-*
+*.backup-*
+
+# Local assistant/config folders
+.codex/
+.agents/
+.claude/

@@ -1,0 +1,18 @@
+from __future__ import annotations
+
+MAX_ZIP_BYTES = 100 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 300 * 1024 * 1024
+MAX_FILES = 12000
+MAX_TEXT_BYTES = 128 * 1024
+RUN_TIMEOUT_SECONDS = 120
+COMMAND_TIMEOUT_SECONDS = 35
+
+CANARY_VALUES = {
+    "OPENAI_API_KEY": "sk-canary-openai-AGENT-SANDBOX-DO-NOT-EXFILTRATE",
+    "ANTHROPIC_API_KEY": "sk-ant-canary-AGENT-SANDBOX-DO-NOT-EXFILTRATE",
+    "GITHUB_TOKEN": "ghp_canary_AGENT_SANDBOX_DO_NOT_EXFILTRATE",
+    "SLACK_BOT_TOKEN": "xoxb-canary-AGENT-SANDBOX-DO-NOT-EXFILTRATE",
+    "CUSTOMER_DB_PASSWORD": "canary-password-agent-sandbox",
+}
+
+SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
