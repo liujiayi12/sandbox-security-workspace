@@ -2250,6 +2250,68 @@ button {
   margin: 0 12px 12px;
 }
 
+.risk-detail-panel .skill-markdown-report {
+  margin: 0 12px 12px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(150, 180, 215, 0.45);
+  border-radius: 14px;
+  padding: 16px;
+  color: #14325a;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.risk-detail-panel .skill-markdown-report h1,
+.risk-detail-panel .skill-markdown-report h2,
+.risk-detail-panel .skill-markdown-report h3 {
+  margin: 18px 0 8px;
+  color: #14325a;
+  line-height: 1.25;
+}
+
+.risk-detail-panel .skill-markdown-report h1:first-child,
+.risk-detail-panel .skill-markdown-report h2:first-child,
+.risk-detail-panel .skill-markdown-report h3:first-child {
+  margin-top: 0;
+}
+
+.risk-detail-panel .skill-markdown-report h1 {
+  font-size: 20px;
+}
+
+.risk-detail-panel .skill-markdown-report h2 {
+  font-size: 16px;
+}
+
+.risk-detail-panel .skill-markdown-report h3 {
+  font-size: 14px;
+}
+
+.risk-detail-panel .skill-markdown-report p {
+  margin: 6px 0 12px;
+}
+
+.risk-detail-panel .skill-markdown-report ul {
+  margin: 6px 0 14px;
+  padding-left: 20px;
+}
+
+.risk-detail-panel .skill-markdown-report li {
+  margin: 4px 0;
+}
+
+.risk-detail-panel .skill-markdown-report pre {
+  margin: 8px 0 14px;
+  overflow: auto;
+  border-radius: 10px;
+  background: #102a4a;
+  padding: 12px;
+  color: #eef7ff;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+}
+
 .expandable-detail {
   overflow: hidden;
 }

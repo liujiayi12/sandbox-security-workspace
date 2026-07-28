@@ -45,9 +45,10 @@ def main() -> int:
         sys.path.insert(0, str(provloom_root))
         os.chdir(provloom_root)
 
-        from app.analyzer.rules import analyze_trace
+        from app.analyzer.rules import analyze_static_skill, analyze_trace
         from app.backend.schemas import LLMConfig
         from app.reporting.risk_mapper import map_risk_profile
+        from app.runtime.skill_parser import load_skill_definition
         from app.runner.docker_runner import DockerRunner
         from app.telemetry.collector import build_execution_report
 
@@ -66,16 +67,27 @@ def main() -> int:
         for index, skill_spec in enumerate(skill_specs, start=1):
             skill_path = isolate_skill_source(skill_spec, prepared_root, index)
             run_id = execution_id if len(skill_specs) == 1 else f"{execution_id}-{index}"
-            results.append(run_one_skill(
-                runner=runner,
-                execution_id=run_id,
-                skill_path=skill_path,
-                request=request,
-                llm_config=llm_config,
-                analyze_trace=analyze_trace,
-                build_execution_report=build_execution_report,
-                map_risk_profile=map_risk_profile,
-            ))
+            try:
+                results.append(run_one_skill(
+                    runner=runner,
+                    execution_id=run_id,
+                    skill_path=skill_path,
+                    request=request,
+                    llm_config=llm_config,
+                    analyze_trace=analyze_trace,
+                    build_execution_report=build_execution_report,
+                    map_risk_profile=map_risk_profile,
+                ))
+            except Exception as exc:
+                results.append(build_failed_skill_result(
+                    execution_id=run_id,
+                    skill_path=skill_path,
+                    request=request,
+                    error=exc,
+                    analyze_static_skill=analyze_static_skill,
+                    load_skill_definition=load_skill_definition,
+                    map_risk_profile=map_risk_profile,
+                ))
 
         result = results[0] if len(results) == 1 else aggregate_results(execution_id, results, request)
         print(json.dumps({"ok": True, "result": json_ready(result)}, ensure_ascii=False))
@@ -111,6 +123,7 @@ def run_one_skill(
     )
     report = analyze_trace(execution, analysis_mode=request.get("analysisMode") or "rule_plus_epg")
     telemetry_report = build_execution_report(execution)
+    apply_behavior_score_floor(report)
     risk_profile = map_risk_profile(
         risk_score=report["risk_score"],
         detected_behaviors=report["detected_behaviors"],
@@ -131,7 +144,7 @@ def run_one_skill(
             "risk_summary": runtime_failure["message"],
         }
 
-    return {
+    result = {
         "executionId": execution_id,
         "status": "completed",
         "executionStatus": "failed" if runtime_failure else "completed",
@@ -182,6 +195,9 @@ def run_one_skill(
         "evidenceStrength": report.get("evidence_strength", ""),
         "decisionRationale": report.get("decision_rationale", {}),
     }
+    result["markdownReport"] = build_markdown_report(result)
+    result["markdown_report"] = result["markdownReport"]
+    return result
 
 
 def aggregate_results(execution_id: str, results: list[dict[str, Any]], request: dict[str, Any]) -> dict[str, Any]:
@@ -211,7 +227,7 @@ def aggregate_results(execution_id: str, results: list[dict[str, Any]], request:
         risk_level_name = max_result.get("riskLevelName", "未知")
         risk_summary = f"本次共检测 {len(results)} 个 Skill，页面展示其中最高风险结果与合并行为证据。"
 
-    return {
+    result = {
         "executionId": execution_id,
         "status": "failed" if failed and not completed else "partial" if failed else "completed",
         "batch": True,
@@ -228,10 +244,429 @@ def aggregate_results(execution_id: str, results: list[dict[str, Any]], request:
         "evidenceTimeline": timeline,
         "skillResults": results,
     }
+    result["markdownReport"] = build_markdown_report(result)
+    result["markdown_report"] = result["markdownReport"]
+    return result
+
+
+def build_failed_skill_result(
+    *,
+    execution_id: str,
+    skill_path: Path,
+    request: dict[str, Any],
+    error: Exception,
+    analyze_static_skill: Any | None = None,
+    load_skill_definition: Any | None = None,
+    map_risk_profile: Any | None = None,
+) -> dict[str, Any]:
+    if is_actionless_skill_error(error) and analyze_static_skill and load_skill_definition and map_risk_profile:
+        try:
+            return build_static_fallback_skill_result(
+                execution_id=execution_id,
+                skill_path=skill_path,
+                request=request,
+                analyze_static_skill=analyze_static_skill,
+                load_skill_definition=load_skill_definition,
+                map_risk_profile=map_risk_profile,
+            )
+        except Exception:
+            pass
+
+    runtime_failure = classify_prepare_or_runtime_error(error)
+    result = {
+        "executionId": execution_id,
+        "status": "completed",
+        "executionStatus": "failed",
+        "runtimeFailure": runtime_failure,
+        "skillName": skill_path.name,
+        "skillPath": str(skill_path),
+        "skillFile": "SKILL.md",
+        "sandboxImage": "",
+        "runtimeName": "",
+        "networkPolicy": request.get("networkPolicy") or "default",
+        "analysisMode": request.get("analysisMode") or "rule_plus_epg",
+        "exitCode": None,
+        "timedOut": False,
+        "stdout": "",
+        "stderr": str(error),
+        "artifactsDir": "",
+        "traceSummary": {},
+        "riskScore": 0,
+        "riskLevel": "unknown",
+        "riskLevelName": "检测未完成",
+        "primaryRisk": {
+            "code": runtime_failure["code"],
+            "name": runtime_failure["title"],
+            "description": runtime_failure["message"],
+            "severity": "unknown",
+        },
+        "riskLabels": [],
+        "riskSummary": runtime_failure["message"],
+        "detectedBehaviors": ["runtime_incomplete"],
+        "evidenceTimeline": [],
+        "fileEvents": [],
+        "networkEvents": [],
+        "processEvents": [],
+        "toolCalls": [],
+        "llmEvents": [],
+        "dataFlows": [],
+        "resourceUsage": {},
+        "primaryChain": [],
+        "rootCause": "runtime_incomplete",
+        "rootCauseDetail": runtime_failure["message"],
+        "graphSummary": {},
+        "finalDecision": "incomplete",
+        "triggeredFactors": [],
+        "suppressionFactors": [],
+        "decisionEvidence": {},
+        "capabilityProfile": {},
+        "capabilityTags": [],
+        "triggerPlan": {},
+        "triggerUsed": [],
+        "triggerHits": [],
+        "triggerUnexecuted": [],
+        "severityLabel": "",
+        "evidenceStrength": "",
+        "decisionRationale": {},
+    }
+    result["markdownReport"] = build_markdown_report(result)
+    result["markdown_report"] = result["markdownReport"]
+    return result
+
+
+def is_actionless_skill_error(error: Exception) -> bool:
+    lowered = str(error or "").lower()
+    return "does not define executable actions" in lowered or "skill-actions" in lowered
+
+
+def build_static_fallback_skill_result(
+    *,
+    execution_id: str,
+    skill_path: Path,
+    request: dict[str, Any],
+    analyze_static_skill: Any,
+    load_skill_definition: Any,
+    map_risk_profile: Any,
+) -> dict[str, Any]:
+    definition = load_skill_definition(skill_path, "SKILL.md", allow_empty_actions=True)
+    report = analyze_static_skill(definition, analysis_mode=request.get("analysisMode") or "rule_plus_epg")
+    heuristic = infer_actionless_text_risk(definition.raw_markdown)
+    if heuristic["detected_behaviors"]:
+        merged_behaviors = sorted(set(report.get("detected_behaviors", [])) | set(heuristic["detected_behaviors"]))
+        report["detected_behaviors"] = merged_behaviors
+        report["risk_score"] = max(int(report.get("risk_score") or 0), heuristic["risk_score"])
+        report["evidence_timeline"] = list(report.get("evidence_timeline") or []) + heuristic["evidence_timeline"]
+        trace_summary = dict(report.get("trace_summary") or {})
+        trace_summary["text_heuristic_count"] = len(heuristic["detected_behaviors"])
+        report["trace_summary"] = trace_summary
+    risk_profile = map_risk_profile(
+        risk_score=report.get("risk_score", 0),
+        detected_behaviors=report.get("detected_behaviors", []),
+    )
+    summary = risk_profile.get("risk_summary", "") or "该 Skill 没有可执行动作定义，已降级为静态能力画像分析。"
+    summary = f"静态降级完成：{summary}"
+    result = {
+        "executionId": execution_id,
+        "status": "completed",
+        "executionStatus": "completed",
+        "runtimeFailure": None,
+        "executionNote": {
+            "code": "static_fallback_no_actions",
+            "title": "动态动作缺失，已静态降级",
+            "message": "SKILL.md 没有定义可执行的 ```skill-actions``` 动作数组；本次使用静态能力画像和规则分析生成评分。",
+        },
+        "skillName": skill_path.name,
+        "skillPath": str(skill_path),
+        "skillFile": "SKILL.md",
+        "sandboxImage": "",
+        "runtimeName": "static-fallback",
+        "networkPolicy": request.get("networkPolicy") or "default",
+        "analysisMode": request.get("analysisMode") or "rule_plus_epg",
+        "exitCode": 0,
+        "timedOut": False,
+        "stdout": "",
+        "stderr": "",
+        "artifactsDir": "",
+        "traceSummary": report.get("trace_summary", {}),
+        "riskScore": report.get("risk_score", 0),
+        "riskLevel": risk_profile.get("risk_level", "unknown"),
+        "riskLevelName": risk_profile.get("risk_level_name", "未知"),
+        "primaryRisk": risk_profile.get("primary_risk", {}),
+        "riskLabels": risk_profile.get("risk_labels", []),
+        "riskSummary": summary,
+        "detectedBehaviors": report.get("detected_behaviors", []),
+        "evidenceTimeline": report.get("evidence_timeline", []),
+        "fileEvents": [],
+        "networkEvents": [],
+        "processEvents": [],
+        "toolCalls": [],
+        "llmEvents": [],
+        "dataFlows": [],
+        "resourceUsage": {},
+        "primaryChain": report.get("primary_chain", []),
+        "rootCause": report.get("root_cause", "unknown"),
+        "rootCauseDetail": report.get("root_cause_detail", "unknown"),
+        "graphSummary": report.get("graph_summary", {}),
+        "finalDecision": report.get("final_decision", "static_fallback"),
+        "triggeredFactors": report.get("triggered_factors", []),
+        "suppressionFactors": report.get("suppression_factors", []),
+        "decisionEvidence": report.get("decision_evidence", {}),
+        "capabilityProfile": report.get("capability_profile", {}),
+        "capabilityTags": report.get("capability_tags", []),
+        "triggerPlan": report.get("trigger_plan", {}),
+        "triggerUsed": report.get("trigger_used", []),
+        "triggerHits": report.get("trigger_hits", []),
+        "triggerUnexecuted": report.get("trigger_unexecuted", []),
+        "severityLabel": report.get("severity_label", ""),
+        "evidenceStrength": report.get("evidence_strength", ""),
+        "decisionRationale": report.get("decision_rationale", {}),
+    }
+    result["markdownReport"] = build_markdown_report(result)
+    result["markdown_report"] = result["markdownReport"]
+    return result
+
+
+def apply_behavior_score_floor(report: dict[str, Any]) -> None:
+    behaviors = set(report.get("detected_behaviors") or [])
+    if not behaviors:
+        return
+
+    weights = {
+        "file_write": 25,
+        "network_access": 35,
+        "process_spawn": 35,
+        "shell_execution": 60,
+        "sensitive_file_read": 65,
+        "read_then_exfiltration": 90,
+        "execution_timeout": 20,
+    }
+    floor = max((weights.get(behavior, 10) for behavior in behaviors), default=0)
+    if {"sensitive_file_read", "network_access"} <= behaviors:
+        floor = max(floor, 80)
+    if {"file_write", "process_spawn"} <= behaviors:
+        floor = max(floor, 50)
+
+    report["risk_score"] = max(int(report.get("risk_score") or 0), min(100, floor))
+
+
+def infer_actionless_text_risk(markdown: str) -> dict[str, Any]:
+    text = str(markdown or "").lower()
+    detected: set[str] = set()
+    timeline: list[dict[str, Any]] = []
+
+    def hit(behavior: str, detail: str) -> None:
+        detected.add(behavior)
+        timeline.append({
+            "timestamp": "static",
+            "category": "static_text",
+            "action": behavior,
+            "detail": detail,
+            "metadata": {"source": "actionless_skill_text_heuristic"},
+        })
+
+    network_markers = ("curl ", "http://", "https://", "api/", "websocket", "sse", "post ", "get ")
+    command_markers = ("bash", "powershell", "shell", "subprocess", "terminal", "npm ", "python ", "execute command", "run command")
+    mutation_markers = ("write", "create", "delete", "overwrite", "upload", "download", "export ", "-o ")
+    sensitive_markers = (
+        "~/.codex",
+        "~/.claude",
+        "~/.ssh",
+        ".env",
+        "api key",
+        "secret",
+        "credential",
+        "token",
+        "cookie",
+        "private key",
+        "session.jsonl",
+        "agent history",
+    )
+    exfil_markers = ("upload", "webhook", "callback", "post ", "send to", "exfil", "external", "remote server")
+
+    if any(marker in text for marker in network_markers):
+        hit("network_access", "SKILL.md describes HTTP/API/network operations.")
+    if any(marker in text for marker in command_markers):
+        hit("process_spawn", "SKILL.md describes command-line or process execution.")
+    if any(marker in text for marker in mutation_markers):
+        hit("file_write", "SKILL.md describes write/create/delete/sync/export operations.")
+    if any(marker in text for marker in sensitive_markers):
+        hit("sensitive_file_read", "SKILL.md describes access to sessions, history, credentials, tokens, or local agent data.")
+    if "sensitive_file_read" in detected and any(marker in text for marker in exfil_markers):
+        hit("read_then_exfiltration", "Text combines sensitive/local data access with an explicit upload/callback/external send pattern.")
+
+    weights = {
+        "network_access": 12,
+        "process_spawn": 18,
+        "file_write": 16,
+        "sensitive_file_read": 35,
+        "read_then_exfiltration": 55,
+    }
+    score = min(75, sum(weights.get(item, 8) for item in detected))
+    if "read_then_exfiltration" in detected:
+        score = max(score, 70)
+    return {
+        "risk_score": score,
+        "detected_behaviors": sorted(detected),
+        "evidence_timeline": timeline,
+    }
+
+
+def classify_prepare_or_runtime_error(error: Exception) -> dict[str, str]:
+    message = str(error or "").strip()
+    lowered = message.lower()
+    if "does not define executable actions" in lowered or "skill-actions" in lowered:
+        return {
+            "code": "skill_actions_missing",
+            "title": "缺少可执行动作定义",
+            "message": "SKILL.md 没有定义可执行的 ```skill-actions``` 动作数组，动态沙箱无法启动该样本。请补充动作定义，或将该样本按静态扫描处理。",
+        }
+    if "docker" in lowered and ("not available" in lowered or "not found" in lowered):
+        return {
+            "code": "docker_unavailable",
+            "title": "Docker 不可用",
+            "message": "当前环境无法调用 Docker CLI 或 Docker Engine，动态沙箱无法运行。",
+        }
+    return {
+        "code": "runtime_failed",
+        "title": "运行准备失败",
+        "message": classify_runtime_blocker(message),
+    }
+
+
+def classify_runtime_blocker(stderr: str) -> str:
+    lowered = str(stderr or "").lower()
+    heavy_markers = (
+        "playwright",
+        "browser",
+        "chrome",
+        "chromium",
+        "electron",
+        "x server",
+        "xvfb",
+        "cuda",
+        "gpu",
+        "kubernetes",
+        "kubectl",
+        "terraform",
+        "aws",
+        "gcloud",
+        "azure",
+    )
+    if any(marker in lowered for marker in heavy_markers):
+        return "目标 Skill 依赖外部重型平台、浏览器/GPU/云平台或本机服务，当前轻量沙箱无法完整启动。请补充 sandbox.yaml、提供替身服务，或改用具备对应依赖的运行环境。"
+    if "module not found" in lowered or "no module named" in lowered or "cannot find module" in lowered:
+        return "目标 Skill 的运行依赖未安装或未声明，沙箱没有产生足够证据。请补充 package.json、requirements.txt 或 sandbox.yaml 后重试。"
+    if "connection refused" in lowered or "name resolution" in lowered or "network is unreachable" in lowered:
+        return "目标 Skill 需要访问外部网络或本地服务，但当前沙箱网络/服务不可达。请检查网络策略或提供可控替身服务。"
+    return "目标 Skill 在动态沙箱中没有产生足够的运行证据。请查看执行线索中的错误输出，确认依赖、入口和模型配置是否完整。"
+
+
+def build_markdown_report(result: dict[str, Any]) -> str:
+    is_batch = bool(result.get("batch"))
+    items = result.get("skillResults") if is_batch else [result]
+    if not isinstance(items, list) or not items:
+        items = [result]
+
+    total = int(result.get("skillCount") or len(items) or 1)
+    completed = int(result.get("completedCount") if result.get("completedCount") is not None else sum(1 for item in items if item.get("executionStatus") == "completed"))
+    failed = int(result.get("failedCount") if result.get("failedCount") is not None else max(0, total - completed))
+    score = int(result.get("riskScore") or 0)
+    level = str(result.get("riskLevelName") or result.get("riskLevel") or "未知")
+    summary = str(result.get("riskSummary") or "检测已完成，请结合证据进行人工复核。")
+
+    lines = [
+        "# Skill 动态沙箱检测报告",
+        "",
+        "## 总览",
+        "",
+        f"- 检测状态：{completed}/{total} 完成" + (f"，{failed} 个未完成" if failed else "，全部完成"),
+        f"- 风险评分：{score}",
+        f"- 风险等级：{level}",
+        f"- 网络策略：{result.get('networkPolicy') or 'default'}",
+        f"- 分析模式：{result.get('analysisMode') or 'rule_plus_epg'}",
+        "",
+        "## 结论",
+        "",
+        summary,
+        "",
+    ]
+
+    behaviors = result.get("detectedBehaviors") or []
+    if behaviors:
+        lines.extend(["## 命中行为", ""])
+        for behavior in behaviors[:12]:
+            lines.append(f"- {format_behavior_label(behavior)}")
+        lines.append("")
+
+    failures = [item for item in items if item.get("executionStatus") == "failed" or item.get("runtimeFailure")]
+    if failures:
+        lines.extend(["## 未完成原因", ""])
+        for item in failures:
+            failure = item.get("runtimeFailure") or {}
+            name = item.get("skillName") or item.get("skillFile") or "Skill"
+            title = failure.get("title") or "运行未完成"
+            message = failure.get("message") or "沙箱没有返回足够证据。"
+            lines.append(f"- {name}：{title}。{message}")
+        lines.append("")
+
+    lines.extend(["## 样本结果", ""])
+    for item in items[:20]:
+        name = item.get("skillName") or item.get("skillFile") or "Skill"
+        item_status = "完成" if item.get("executionStatus") == "completed" else "未完成"
+        item_score = int(item.get("riskScore") or 0)
+        item_level = item.get("riskLevelName") or item.get("riskLevel") or "未知"
+        item_summary = item.get("riskSummary") or item.get("runtimeFailure", {}).get("message") or ""
+        lines.append(f"### {name}")
+        lines.append("")
+        lines.append(f"- 状态：{item_status}")
+        lines.append(f"- 分数：{item_score}")
+        lines.append(f"- 等级：{item_level}")
+        if item_summary:
+            lines.append(f"- 摘要：{item_summary}")
+        lines.append("")
+
+    timeline = result.get("evidenceTimeline") or []
+    if timeline:
+        lines.extend(["## 执行线索", ""])
+        for event in timeline[:12]:
+            if isinstance(event, dict):
+                text = event.get("summary") or event.get("message") or event.get("event") or event.get("action") or event.get("type") or json.dumps(event, ensure_ascii=False)[:180]
+                prefix = f"{event.get('skill')}：" if event.get("skill") else ""
+                lines.append(f"- {prefix}{text}")
+            else:
+                lines.append(f"- {event}")
+        lines.append("")
+
+    lines.extend([
+        "## 复核建议",
+        "",
+        "- 高分或命中文件写入、进程启动、网络访问、敏感读取时，建议人工复核 SKILL.md、动作定义和运行证据。",
+        "- 只有在“未完成原因”出现时，才把结果视为环境或外部依赖阻塞；否则以风险评分和命中行为为主要结论。",
+    ])
+    return "\n".join(lines).strip() + "\n"
+
+
+def format_behavior_label(value: Any) -> str:
+    key = str(value or "")
+    labels = {
+        "runtime_incomplete": "运行未完成",
+        "network_connect": "网络连接行为",
+        "file_read": "文件读取行为",
+        "file_write": "文件写入行为",
+        "process_spawn": "进程启动行为",
+        "llm_request": "模型调用行为",
+        "sensitive_file_read": "敏感文件读取",
+        "read_then_exfiltration": "读取后外传链路",
+        "unsafe_or_risky_command_execution": "高风险命令执行",
+    }
+    return labels.get(key, key.replace("_", " "))
 
 
 def summarize_runtime_failure(execution: Any, report: dict[str, Any], telemetry_report: dict[str, Any]) -> dict[str, Any] | None:
+    has_evidence = has_runtime_evidence(report, telemetry_report)
     if execution.timed_out:
+        if has_evidence:
+            return None
         return {
             "code": "execution_timeout",
             "title": "运行超时",
@@ -257,7 +692,7 @@ def summarize_runtime_failure(execution: Any, report: dict[str, Any], telemetry_
             "message": "沙箱运行目录中没有可识别的 SKILL.md。请上传完整 Skill 目录压缩包、直接上传 SKILL.md，或提供可下载的源码/压缩包 URL。",
         }
 
-    if has_runtime_evidence(report, telemetry_report):
+    if has_evidence:
         return None
 
     return {
@@ -569,9 +1004,14 @@ def extract_zip(zip_path: Path, target_dir: Path) -> None:
                 continue
             relative = safe_relative_path(member.filename)
             target = target_dir / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as src, target.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+            except OSError:
+                if target.name.lower() == "skill.md":
+                    raise
+                continue
 
 
 def safe_relative_path(value: str) -> Path:

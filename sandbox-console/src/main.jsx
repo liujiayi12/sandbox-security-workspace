@@ -1300,15 +1300,22 @@ function ResultAside({ title, result, emptyIcon, emptyTitle, emptyText, fallback
   );
 }
 
+function getSkillRunStats(result) {
+  const batchItems = Array.isArray(result?.skillResults) ? result.skillResults : [];
+  const items = batchItems.length ? batchItems : result ? [result] : [];
+  const total = Number(result?.skillCount || items.length || 1);
+  const completedFallback = items.filter((item) => item?.executionStatus !== "failed" && item?.status !== "failed").length;
+  const completed = Number(result?.completedCount ?? completedFallback);
+  const failed = Number(result?.failedCount ?? Math.max(0, total - completed));
+  return { items, batchItems, total, completed, failed };
+}
+
 function SkillRiskDashboard({ result }) {
   if (!result) return null;
   const score = Number(result.riskScore ?? 0);
   const level = result.riskLevelName || result.riskLevel || "未评级";
   const tone = getSkillRiskTone(result);
-  const batchItems = Array.isArray(result.skillResults) ? result.skillResults : [];
-  const total = Number(result.skillCount || batchItems.length || 1);
-  const completed = Number(result.completedCount ?? batchItems.filter((item) => item.executionStatus === "completed").length);
-  const failed = Number(result.failedCount ?? Math.max(0, total - completed));
+  const { batchItems, total, completed, failed } = getSkillRunStats(result);
   const behaviors = Array.isArray(result.detectedBehaviors) ? result.detectedBehaviors : [];
   const timeline = Array.isArray(result.evidenceTimeline) ? result.evidenceTimeline : [];
   const primaryFailure = result.runtimeFailure || batchItems.find((item) => item.runtimeFailure)?.runtimeFailure;
@@ -1357,10 +1364,175 @@ function SkillRiskDashboard({ result }) {
       {result.batch ? <SkillBatchSummary results={batchItems} /> : null}
       <EvidenceSpotlight behaviors={behaviors} timeline={timeline} />
       <ExpandableDetail title="完整检测明细" className="risk-detail-panel">
-        <JsonPreview data={result} />
+        <SkillMarkdownReport result={result} />
+        <details className="json-preview">
+          <summary>原始 JSON 数据</summary>
+          <pre>{JSON.stringify(result, null, 2)}</pre>
+        </details>
       </ExpandableDetail>
     </div>
   );
+}
+
+
+function SkillMarkdownReport({ result }) {
+  const markdown = result?.markdownReport || result?.markdown_report || buildClientSkillMarkdownReport(result);
+  return (
+    <div className="skill-markdown-report">
+      <RenderedMarkdown markdown={markdown} />
+    </div>
+  );
+}
+
+
+function RenderedMarkdown({ markdown }) {
+  const blocks = parseSimpleMarkdown(markdown);
+  return blocks.map((block, index) => {
+    const key = `${block.type}-${index}`;
+    if (block.type === "heading") {
+      const Tag = `h${Math.min(3, Math.max(1, block.level))}`;
+      return <Tag key={key}>{block.text}</Tag>;
+    }
+    if (block.type === "list") {
+      return (
+        <ul key={key}>
+          {block.items.map((item, itemIndex) => <li key={`${key}-${itemIndex}`}>{item}</li>)}
+        </ul>
+      );
+    }
+    if (block.type === "code") {
+      return <pre key={key}><code>{block.text}</code></pre>;
+    }
+    return <p key={key}>{block.text}</p>;
+  });
+}
+
+
+function parseSimpleMarkdown(markdown) {
+  const lines = String(markdown || "").replace(/\r\n/g, "\n").split("\n");
+  const blocks = [];
+  let paragraph = [];
+  let list = [];
+  let code = [];
+  let inCode = false;
+
+  const flushParagraph = () => {
+    const text = paragraph.join(" ").trim();
+    if (text) blocks.push({ type: "paragraph", text });
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (list.length) blocks.push({ type: "list", items: list });
+    list = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    if (line.trim().startsWith("```")) {
+      if (inCode) {
+        blocks.push({ type: "code", text: code.join("\n") });
+        code = [];
+        inCode = false;
+      } else {
+        flushParagraph();
+        flushList();
+        inCode = true;
+      }
+      continue;
+    }
+    if (inCode) {
+      code.push(rawLine);
+      continue;
+    }
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      blocks.push({ type: "heading", level: heading[1].length, text: heading[2].trim() });
+      continue;
+    }
+    const bullet = /^[-*]\s+(.+)$/.exec(line);
+    if (bullet) {
+      flushParagraph();
+      list.push(bullet[1].trim());
+      continue;
+    }
+    flushList();
+    paragraph.push(line.trim());
+  }
+
+  if (inCode) blocks.push({ type: "code", text: code.join("\n") });
+  flushParagraph();
+  flushList();
+  return blocks;
+}
+
+
+function buildClientSkillMarkdownReport(result) {
+  if (!result) return "";
+  const items = Array.isArray(result.skillResults) && result.skillResults.length ? result.skillResults : [result];
+  const { total, completed, failed } = getSkillRunStats(result);
+  const behaviors = Array.isArray(result.detectedBehaviors) ? result.detectedBehaviors : [];
+  const timeline = Array.isArray(result.evidenceTimeline) ? result.evidenceTimeline : [];
+  const lines = [
+    "# Skill 动态沙箱检测报告",
+    "",
+    "## 总览",
+    "",
+    `- 检测状态：${completed}/${total} 完成${failed ? `，${failed} 个未完成` : "，全部完成"}`,
+    `- 风险评分：${Number(result.riskScore || 0)}`,
+    `- 风险等级：${result.riskLevelName || result.riskLevel || "未知"}`,
+    "",
+    "## 结论",
+    "",
+    result.riskSummary || "检测已完成，请结合证据进行人工复核。",
+    "",
+  ];
+
+  if (behaviors.length) {
+    lines.push("## 命中行为", "");
+    behaviors.slice(0, 12).forEach((item) => lines.push(`- ${humanizeEvidenceKey(item)}`));
+    lines.push("");
+  }
+
+  const failures = items.filter((item) => item.executionStatus === "failed" || item.runtimeFailure);
+  if (failures.length) {
+    lines.push("## 未完成原因", "");
+    failures.forEach((item) => {
+      const failure = item.runtimeFailure || {};
+      lines.push(`- ${item.skillName || item.skillFile || "Skill"}：${failure.title || "运行未完成"}。${failure.message || "沙箱没有返回足够证据。"}`);
+    });
+    lines.push("");
+  }
+
+  lines.push("## 样本结果", "");
+  items.slice(0, 20).forEach((item) => {
+    lines.push(`### ${item.skillName || item.skillFile || "Skill"}`);
+    lines.push("");
+    lines.push(`- 状态：${item.executionStatus === "completed" ? "完成" : "未完成"}`);
+    lines.push(`- 分数：${Number(item.riskScore || 0)}`);
+    lines.push(`- 等级：${item.riskLevelName || item.riskLevel || "未知"}`);
+    if (item.riskSummary || item.runtimeFailure?.message) {
+      lines.push(`- 摘要：${item.riskSummary || item.runtimeFailure.message}`);
+    }
+    lines.push("");
+  });
+
+  if (timeline.length) {
+    lines.push("## 执行线索", "");
+    timeline.slice(0, 12).forEach((item) => lines.push(`- ${formatTimelineText(item)}`));
+    lines.push("");
+  }
+
+  lines.push("## 复核建议", "");
+  lines.push("- 高分或命中文件写入、进程启动、网络访问、敏感读取时，建议人工复核 SKILL.md、动作定义和运行证据。");
+  lines.push("- 只有出现未完成原因时，才把结果视为环境或外部依赖阻塞；否则以风险评分和命中行为为主要结论。");
+  return `${lines.join("\n")}\n`;
 }
 
 
@@ -1424,7 +1596,7 @@ function EvidenceSpotlight({ behaviors, timeline }) {
 function getSkillRiskTone(result) {
   const level = String(result?.riskLevel || result?.riskLevelName || "").toLowerCase();
   const score = Number(result?.riskScore || 0);
-  const failed = Number(result?.failedCount || 0);
+  const { failed } = getSkillRunStats(result);
   if (result?.executionStatus === "failed" || result?.status === "failed" || failed > 0 || level.includes("未完成")) return "warning";
   if (level.includes("critical") || level.includes("high") || level.includes("高") || score >= 70) return "danger";
   if (level.includes("medium") || level.includes("中") || score >= 35) return "warning";
@@ -1789,4 +1961,3 @@ function App() {
 }
 
 createRoot(document.getElementById("root")).render(<App />);
-
