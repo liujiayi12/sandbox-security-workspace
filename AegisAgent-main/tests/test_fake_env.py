@@ -9,7 +9,7 @@ from typing import Iterator
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from agent_sandbox.fake_env import FakeEnvironmentHandler
+from agent_sandbox.fake_env import FakeEnvironmentHandler, _parse_dns_query, _record_dns_query
 from agent_sandbox.real_services import selected_real_service_presets, write_real_service_plan
 
 
@@ -74,6 +74,26 @@ def seed_fixture(root: Path, relative: str, content: str) -> None:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def dns_query(name: str) -> bytes:
+    labels = b"".join(bytes([len(part)]) + part.encode("ascii") for part in name.split("."))
+    return b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + labels + b"\x00\x00\x01\x00\x01"
+
+
+def test_fake_dns_query_parser_and_recorder(tmp_path: Path) -> None:
+    query = _parse_dns_query(dns_query("a1b2c3d4e5f6g7h8i9j0.example.test"))
+
+    assert query is not None
+    assert query["name"] == "a1b2c3d4e5f6g7h8i9j0.example.test"
+    assert query["looks_encoded"] is True
+
+    _record_dns_query(tmp_path, query, "172.18.0.5")
+
+    events = (tmp_path / "dns_events.jsonl").read_text(encoding="utf-8")
+    state = json.loads((tmp_path / "state" / "state.json").read_text(encoding="utf-8"))
+    assert "a1b2c3d4e5f6g7h8i9j0.example.test" in events
+    assert state["objects"]["dns_queries"]["1"]["client"] == "172.18.0.5"
 
 
 def test_fake_environment_supports_common_collaboration_sdk_routes(tmp_path: Path) -> None:

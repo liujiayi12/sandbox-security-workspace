@@ -65,6 +65,7 @@ export async function runSkillDynamicSandbox(payload = {}) {
         maxBuffer: 80 * 1024 * 1024,
         env: {
           ...process.env,
+          PYTHONIOENCODING: "utf-8",
           PYTHONPATH: provloomRoot,
           TMPDIR: path.join(workRoot, "tmp"),
           PATH: withDockerOnPath(process.env.PATH || process.env.Path || ""),
@@ -76,7 +77,7 @@ export async function runSkillDynamicSandbox(payload = {}) {
       if (parsed) {
         return parsed;
       }
-      const message = String(error.stderr || error.message || "动态沙箱执行失败。").trim();
+      const message = String(error.stderr || error.message || "动态沙箱运行失败").trim();
       throw new Error(message);
     } finally {
       fs.rm(requestPath, { force: true }).catch(() => {});
@@ -87,7 +88,12 @@ export async function runSkillDynamicSandbox(payload = {}) {
 }
 
 function normalizeRequest(payload = {}) {
-  const files = Array.isArray(payload.files) ? payload.files.map(normalizeFilePayload).filter(Boolean) : [];
+  const incomingFiles = Array.isArray(payload.files)
+    ? payload.files
+    : payload.file
+      ? [payload.file]
+      : [];
+  const files = incomingFiles.map(normalizeFilePayload).filter(Boolean);
   const sourceUrl = String(payload.sourceUrl || payload.url || "").trim();
   const inputPayload = normalizeInputPayload(payload.inputPayload);
   const timeoutSeconds = normalizePositiveInt(payload.timeoutSeconds, 600, { min: 1, max: 600 });
@@ -127,7 +133,7 @@ function normalizeInputPayload(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const normalized = { ...value };
     const prompt = String(normalized.prompt || "").trim();
-    if (prompt === "请对这个 Skill 执行一次安全观察") {
+    if (prompt === "请快速执行 Skill 的主要入口，返回可观察到的安全行为证据。") {
       normalized.prompt = defaultDynamicExecutionPrompt();
     }
     return normalized;
@@ -137,10 +143,12 @@ function normalizeInputPayload(value) {
 
 function normalizeLlmConfig(config = {}) {
   const enabled = config.enabled !== false;
-  const provider = String(config.provider || "siliconflow").trim();
-  const baseUrl = String(config.baseUrl || config.base_url || "https://api.siliconflow.cn/v1").trim();
+  const rawProvider = String(config.provider || "").trim();
+  const rawBaseUrl = String(config.baseUrl || config.base_url || "").trim();
   const apiKey = String(config.apiKey || config.api_key || "").trim();
   const model = String(config.model || "deepseek-ai/DeepSeek-V3").trim();
+  const baseUrl = normalizeLlmBaseUrl(rawBaseUrl, model);
+  const provider = normalizeLlmProvider(rawProvider, baseUrl);
   return {
     enabled,
     provider,
@@ -150,14 +158,44 @@ function normalizeLlmConfig(config = {}) {
   };
 }
 
+function normalizeLlmBaseUrl(baseUrl = "", model = "") {
+  const trimmed = String(baseUrl || "").trim().replace(/\/+$/, "");
+  const normalizedModel = String(model || "").trim().toLowerCase();
+  if (
+    !trimmed ||
+    ((normalizedModel === "deepseek-chat" || normalizedModel.startsWith("deepseek-reasoner")) &&
+      trimmed.includes("siliconflow.cn"))
+  ) {
+    if (normalizedModel === "deepseek-chat" || normalizedModel.startsWith("deepseek-reasoner")) {
+      return "https://api.deepseek.com";
+    }
+  }
+  return trimmed || "https://api.siliconflow.cn/v1";
+}
+
+function inferLlmProvider(baseUrl = "") {
+  const lowered = String(baseUrl || "").toLowerCase();
+  if (lowered.includes("deepseek.com")) return "deepseek";
+  if (lowered.includes("siliconflow")) return "siliconflow";
+  return "openai-compatible";
+}
+
+function normalizeLlmProvider(provider = "", baseUrl = "") {
+  const inferred = inferLlmProvider(baseUrl);
+  const normalized = String(provider || "").trim();
+  if (!normalized) return inferred;
+  if (inferred !== "openai-compatible" && normalized !== inferred) return inferred;
+  return normalized;
+}
+
 function defaultDynamicExecutionPrompt() {
-  return "请按 SKILL.md 的主要说明实际执行这个 Skill 的首要工作流。若文档要求注册、初始化、创建账号、申请 token 或调用外部 API，请在沙箱内执行对应第一步；不要只做安全观察或文档审计。";
+  return "请根据 SKILL.md 的说明执行一次核心工作流，记录文件、进程、网络和工具调用证据。优先触发 Skill 的主要入口，避免真实破坏性操作；如需凭据或外部 API，请使用占位输入并记录阻断原因。";
 }
 
 function parseBridgeResponse(stdout, stderr, throwOnEmpty = true) {
   const clean = String(stdout || "").trim();
   if (!clean) {
-    if (throwOnEmpty) throw new Error(String(stderr || "动态沙箱没有返回结果。").trim());
+    if (throwOnEmpty) throw new Error(String(stderr || "动态沙箱没有返回有效结果").trim());
     return null;
   }
 
@@ -170,7 +208,7 @@ function parseBridgeResponse(stdout, stderr, throwOnEmpty = true) {
 
   const data = JSON.parse(clean.slice(start, end + 1));
   if (!data.ok) {
-    const error = new Error(data.message || "动态沙箱执行失败。");
+    const error = new Error(data.message || "动态沙箱运行失败");
     error.code = data.code || "SANDBOX_FAILED";
     throw error;
   }

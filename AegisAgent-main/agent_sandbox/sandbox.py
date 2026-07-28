@@ -21,8 +21,10 @@ from .adapters import AdapterCandidate, candidate_from_dict, detect_adapters
 from .artifacts import ARTIFACT_STEPS, render_attack_artifact
 from .attack import scan_canaries
 from .constants import CANARY_VALUES, COMMAND_TIMEOUT_SECONDS
-from .deployment import CACHE_PREFIX, BuildOptions, build_environment, build_failure_dict, create_build_plan, runtime_start_command, _remember_image_exists
+from .deployment import CACHE_PREFIX, BuildOptions, build_environment, build_failure_dict, create_build_plan, normalize_build_options, runtime_start_command, _remember_image_exists
+from .fs_utils import safe_project_copytree, safe_walk_file_iter
 from .ingest import _fs_path, safe_rmtree
+from .provenance import prepare_provenance_workspace, provenance_runtime_env
 from .real_services import REAL_SERVICE_SCENARIOS, RealServicePreset, selected_real_service_presets, write_real_service_plan
 from .schemas import AttackPlan, AttackStep, ProjectProfile
 
@@ -58,6 +60,9 @@ class SandboxResult:
     fake_environment: dict[str, Any] = field(default_factory=dict)
     image_cleanup: list[dict[str, Any]] = field(default_factory=list)
     launch: dict[str, Any] = field(default_factory=dict)
+    filesystem_warnings: list[dict[str, str]] = field(default_factory=list)
+    provenance_seeds: dict[str, Any] = field(default_factory=dict)
+    repository_status: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -105,6 +110,7 @@ class LaunchResult:
 class FakeEnvironment:
     network_name: str | None
     container_id: str | None
+    ip_address: str | None = None
     base_url: str = FAKE_ENV_BASE_URL
     sink_url: str = FAKE_ENV_SINK_URL
     failures: list[dict[str, Any]] = field(default_factory=list)
@@ -141,21 +147,25 @@ def run_dynamic_sandbox(
 ) -> SandboxResult:
     runtime_env = _runtime_env_with_provider_aliases(_clean_runtime_env(runtime_env or {}))
     runtime_network = _clean_runtime_network(runtime_network)
-    build_options = BuildOptions(build_mode=build_mode, allow_install_scripts=allow_install_scripts, cache_policy=cache_policy)
+    build_options = normalize_build_options(build_mode=build_mode, allow_install_scripts=allow_install_scripts, cache_policy=cache_policy)
     ok, error = docker_available()
     if not ok:
         return SandboxResult(status="docker_unavailable", failures=[{"stage": "docker", "reason": error}])
     workdir = workspace / "runtime"
     if workdir.exists():
         safe_rmtree(workdir)
-    shutil.copytree(_fs_path(root.resolve()), _fs_path(workdir.resolve()), symlinks=False)
+    result = SandboxResult(status="dynamic_failed")
+    copy_warnings = safe_project_copytree(root, workdir)
+    result.filesystem_warnings.extend(copy_warnings)
+    if copy_warnings:
+        result.interactions.append({"step": "filesystem_prepare", "ok": True, "warnings": copy_warnings[:50]})
     _prepare_fake_runtime_repo(workdir)
     _write_canary_env(workdir)
+    result.provenance_seeds = prepare_provenance_workspace(workdir)
     before = _snapshot(workdir)
     adapters = [candidate_from_dict(item) for item in profile.adapter_matches] or detect_adapters(workdir, profile)
     build_results_by_key: dict[str, Any] = {}
     build_images_seen: set[str] = set()
-    result = SandboxResult(status="dynamic_failed")
     try:
         for adapter in adapters:
             adapter_result = _try_adapter(workdir, adapter, plan, runtime_env, runtime_network, build_options, build_results_by_key)
@@ -183,6 +193,7 @@ def run_dynamic_sandbox(
                 result.adapter = adapter.to_dict()
         after = _snapshot(workdir)
         result.file_diff = _diff_snapshots(before, after)
+        result.repository_status = _repository_status(workdir)
         result.canary_hits = scan_canaries(workdir, baseline_files={".env"})
         result.network_events = _extract_network_intent(result.install_logs + result.run_logs + result.interactions)
         if result.status != "dynamic_completed" and not result.failures:
@@ -198,13 +209,15 @@ def _try_adapter(root: Path, adapter: AdapterCandidate, plan: AttackPlan, runtim
     result = SandboxResult(status="dynamic_failed", runner=adapter.name, adapter=adapter.to_dict())
     build_plan = create_build_plan(root, adapter, build_options)
     build_result = _build_or_reuse_environment(root, build_plan, build_options, build_results_by_key)
-    result.build_plan = build_plan.to_dict()
+    final_plan_dict = build_result.final_plan if getattr(build_result, "final_plan", None) else build_plan.to_dict()
+    result.build_plan = final_plan_dict
     result.build_result = build_result.to_dict()
     result.install_logs.extend(build_result.logs)
+    runtime_plan = _runtime_plan_from_dict(build_plan, final_plan_dict)
     if build_result.status in {"failed", "skipped"} or not build_result.image:
-        result.failures.append(build_failure_dict(build_plan, build_result, adapter))
+        result.failures.append(build_failure_dict(runtime_plan, build_result, adapter))
         return result
-    runtime_adapter = replace(adapter, image=build_result.image, start=runtime_start_command(build_plan), install=[])
+    runtime_adapter = replace(adapter, image=build_result.image, start=runtime_start_command(runtime_plan), install=[])
     fake_env: FakeEnvironment | None = None
     effective_network = runtime_network
     if runtime_network == "sandbox":
@@ -212,6 +225,7 @@ def _try_adapter(root: Path, adapter: AdapterCandidate, plan: AttackPlan, runtim
         result.failures.extend(fake_env.failures)
         effective_network = fake_env.network_name or "none"
     adapter_runtime_env = _runtime_env_for_adapter(runtime_env, runtime_adapter)
+    adapter_runtime_env.update({key: value for key, value in provenance_runtime_env(root).items() if key not in adapter_runtime_env})
     if fake_env:
         for key, value in _fake_env_runtime_env(fake_env).items():
             adapter_runtime_env.setdefault(key, value)
@@ -283,6 +297,26 @@ def _try_adapter(root: Path, adapter: AdapterCandidate, plan: AttackPlan, runtim
         if fake_env:
             result.fake_environment = _fake_environment_summary(root, fake_env)
             _stop_fake_environment(fake_env)
+
+
+def _runtime_plan_from_dict(original: Any, data: dict[str, Any] | None) -> Any:
+    if not isinstance(data, dict):
+        return original
+    try:
+        return replace(
+            original,
+            language=str(data.get("language") or original.language),
+            framework=data.get("framework", original.framework),
+            protocol=str(data.get("protocol") or original.protocol),
+            base_image=str(data.get("base_image") or original.base_image),
+            start_command=data.get("start_command", original.start_command),
+            install_commands=[str(item) for item in data.get("install_commands", original.install_commands) or []],
+            build_commands=[str(item) for item in data.get("build_commands", original.build_commands) or []],
+            cache_key=str(data.get("cache_key") or original.cache_key),
+            cache_image=str(data.get("cache_image") or original.cache_image),
+        )
+    except Exception:
+        return original
 
 
 def _build_or_reuse_environment(root: Path, build_plan: Any, build_options: BuildOptions, build_results_by_key: dict[str, Any] | None) -> Any:
@@ -675,7 +709,7 @@ def _start_detached(root: Path, adapter: AdapterCandidate, network: str, publish
         raise RuntimeError("No start command")
     host_port = _free_port() if publish_port else None
     memory = memory or _runtime_memory(adapter)
-    args = ["docker", "run", "-d", f"--network={network}", *_security_args(memory=memory), *(_env_args(runtime_env))]
+    args = ["docker", "run", "-d", f"--network={network}", *_dns_args(network, runtime_env), *_security_args(memory=memory), *(_env_args(runtime_env))]
     if publish_port and host_port and adapter.port:
         args.extend(["-p", f"127.0.0.1:{host_port}:{adapter.port}"])
     args.extend(["-w", "/workspace", adapter.image, "sh", "-lc", adapter.start])
@@ -820,7 +854,7 @@ def _discover_http_paths(root: Path) -> list[str]:
 
 def _discover_static_http_interfaces(root: Path, port: int) -> list[dict[str, Any]]:
     interfaces: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*"))[:1200]:
+    for path in safe_walk_file_iter(root, limit=1200):
         if not path.is_file() or path.suffix.lower() not in {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".php", ".rb", ".cs", ".kt", ".scala", ".md", ".http", ".properties", ".yaml", ".yml"}:
             continue
         text = _read_probe_text(path)
@@ -1363,6 +1397,7 @@ def _container_http_request(running: RunningProcess, method: str, url: str, head
         "--cpus=0.5",
         "--pids-limit=64",
         "--cap-drop=ALL",
+        "--cap-add=NET_BIND_SERVICE",
         "--security-opt=no-new-privileges",
         "-e",
         f"AGENT_SANDBOX_HTTP_METHOD={method}",
@@ -1923,7 +1958,7 @@ def _mark_fake_env_scenario_step(state: dict[str, Any], step_name: str, evidence
 def _find_files_by_keywords(root: Path, keywords: tuple[str, ...]) -> list[dict[str, Any]]:
     root_resolved = root.resolve()
     matches: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*"))[:2000]:
+    for path in safe_walk_file_iter(root, limit=2000):
         if not path.is_file() or _skip_evidence_path(path, root_resolved):
             continue
         rel = path.resolve().relative_to(root_resolved).as_posix()
@@ -2003,7 +2038,8 @@ def _start_fake_environment(root: Path) -> FakeEnvironment:
     if proc.returncode != 0:
         failures.append({"stage": "fake_environment", "failure_class": "fake_env_start_failed", "reason": (proc.stderr or proc.stdout).strip()[:1000]})
         return FakeEnvironment(network_name=network_name, container_id=None, failures=failures, service_containers=service_containers, real_service_plan=real_service_plan, real_service_readiness=service_readiness, real_service_initialization=initialization)
-    env = FakeEnvironment(network_name=network_name, container_id=proc.stdout.strip(), failures=failures, service_containers=service_containers, real_service_plan=real_service_plan, real_service_readiness=service_readiness, real_service_initialization=initialization)
+    container_id = proc.stdout.strip()
+    env = FakeEnvironment(network_name=network_name, container_id=container_id, ip_address=_container_network_ip(container_id, network_name), failures=failures, service_containers=service_containers, real_service_plan=real_service_plan, real_service_readiness=service_readiness, real_service_initialization=initialization)
     _wait_for_fake_environment(root, env)
     initialization = _initialize_real_services(root, network_name, selected_services)
     env.real_service_initialization = initialization
@@ -2830,6 +2866,7 @@ def _fake_env_runtime_env(fake_env: FakeEnvironment) -> dict[str, str]:
         return {}
     return {
         "AGENT_SANDBOX_FAKE_BASE_URL": fake_env.base_url,
+        "AGENT_SANDBOX_FAKE_ENV_IP": fake_env.ip_address or "",
         "AGENT_SANDBOX_SINK_URL": fake_env.sink_url,
         "AGENT_SANDBOX_STATE_URL": f"{fake_env.base_url}/state",
         "AGENT_SANDBOX_AUDIT_URL": f"{fake_env.base_url}/audit",
@@ -2927,9 +2964,11 @@ def _fake_environment_summary(root: Path, fake_env: FakeEnvironment | None = Non
     return {
         "enabled": bool(fake_env and fake_env.network_name),
         "network": fake_env.network_name if fake_env else None,
+        "ip_address": fake_env.ip_address if fake_env else None,
         "base_url": fake_env.base_url if fake_env else FAKE_ENV_BASE_URL,
         "sink_url": fake_env.sink_url if fake_env else FAKE_ENV_SINK_URL,
         "events": events[-100:],
+        "dns_events": _read_fake_dns_events(root)[-100:],
         "event_counts": _fake_event_counts(events),
         "sink_events": [event for event in events if str(event.get("path", "")).startswith("/sink")][-50:],
         "state": state,
@@ -2955,6 +2994,19 @@ def _fake_event_counts(events: list[dict[str, Any]]) -> dict[str, int]:
 
 def _read_fake_env_events(root: Path) -> list[dict[str, Any]]:
     path = root / ".agent_sandbox" / "fake_env" / "events.jsonl"
+    if not path.exists():
+        return []
+    events = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[-300:]:
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def _read_fake_dns_events(root: Path) -> list[dict[str, Any]]:
+    path = root / ".agent_sandbox" / "fake_env" / "dns_events.jsonl"
     if not path.exists():
         return []
     events = []
@@ -3058,7 +3110,7 @@ def _run_in_image(
     runtime_env = runtime_env or {}
     container_name = f"agent-sandbox-run-{abs(hash((str(root), step, time.time_ns()))) % 100000000}"
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
-    args.extend(["--rm", "--name", container_name, f"--network={network}", *_security_args(memory=memory), *(_env_args(runtime_env))])
+    args.extend(["--rm", "--name", container_name, f"--network={network}", *_dns_args(network, runtime_env), *_security_args(memory=memory), *(_env_args(runtime_env))])
     args.extend(["-v", f"{root.resolve()}:{workdir}"])
     if read_only:
         args.extend(["--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m"])
@@ -3107,6 +3159,14 @@ def _env_args(runtime_env: dict[str, str] | None = None) -> list[str]:
     return args
 
 
+def _dns_args(network: str, runtime_env: dict[str, str] | None = None) -> list[str]:
+    env = runtime_env or {}
+    ip = env.get("AGENT_SANDBOX_FAKE_ENV_IP") or ""
+    if not ip or not network.startswith("agent-sandbox-net-"):
+        return []
+    return ["--dns", ip]
+
+
 def _write_canary_env(root: Path) -> None:
     lines = [f"{key}={value}" for key, value in CANARY_VALUES.items()]
     (root / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -3137,16 +3197,14 @@ def _prepare_fake_runtime_repo(root: Path) -> None:
 
 def _snapshot(root: Path) -> dict[str, tuple[int, int]]:
     snap: dict[str, tuple[int, int]] = {}
-    for current, dirs, files in os.walk(root):
-        dirs[:] = [name for name in dirs if name not in SKIP_EVIDENCE_DIRS]
-        current_path = Path(current)
-        for name in files:
-            path = current_path / name
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
+    for path in safe_walk_file_iter(root, limit=5000):
+        if _should_skip_path(path, root):
+            continue
+        try:
+            stat = path.stat()
             snap[path.relative_to(root).as_posix()] = (stat.st_size, int(stat.st_mtime))
+        except OSError:
+            continue
     return snap
 
 
@@ -3163,6 +3221,30 @@ def _diff_snapshots(before: dict[str, tuple[int, int]], after: dict[str, tuple[i
     after_keys = set(after)
     changed = sorted(path for path in before_keys & after_keys if before[path] != after[path])
     return {"created": sorted(after_keys - before_keys)[:200], "deleted": sorted(before_keys - after_keys)[:200], "changed": changed[:200]}
+
+
+def _repository_status(root: Path) -> dict[str, Any]:
+    if not (root / ".git").exists() or not shutil.which("git"):
+        return {"available": False, "reason": "git repository not initialized"}
+    try:
+        status = subprocess.run(["git", "status", "--porcelain=v1"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+        diff_names = subprocess.run(["git", "diff", "--name-only"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "reason": str(exc)[:500]}
+    entries = []
+    for line in status.stdout.splitlines()[:200]:
+        if not line:
+            continue
+        code = line[:2]
+        path = line[3:].strip() if len(line) > 3 else line.strip()
+        entries.append({"status": code, "path": path})
+    return {
+        "available": status.returncode == 0,
+        "returncode": status.returncode,
+        "changed_files": entries,
+        "diff_files": [line.strip() for line in diff_names.stdout.splitlines() if line.strip()][:200] if diff_names.returncode == 0 else [],
+        "stderr": (status.stderr or diff_names.stderr)[-1000:],
+    }
 
 
 def _extract_network_intent(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3194,6 +3276,21 @@ def _container_state(container_id: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return state if isinstance(state, dict) else None
+
+
+def _container_network_ip(container_id: str, network_name: str | None) -> str | None:
+    if not container_id or not network_name:
+        return None
+    proc = subprocess.run(["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", container_id], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8)
+    if proc.returncode != 0:
+        return None
+    try:
+        networks = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError:
+        return None
+    network = networks.get(network_name) if isinstance(networks, dict) else None
+    ip = network.get("IPAddress") if isinstance(network, dict) else None
+    return str(ip) if ip else None
 
 
 def _container_logs(container_id: str) -> str:

@@ -39,15 +39,15 @@ def resolve_skill_target(skill_path: str) -> tuple[Path, str]:
         raise ValueError(f"Skill path does not exist: {source}")
 
     if source.is_file():
-        if source.name != "SKILL.md":
+        if source.name.lower() != "skill.md":
             raise ValueError("When skill_path is a file it must point to SKILL.md.")
         return source.parent, source.name
 
-    direct = source / "SKILL.md"
+    direct = _find_direct_skill_file(source)
     if direct.exists():
-        return source, "SKILL.md"
+        return source, direct.name
 
-    candidates = sorted(source.rglob("SKILL.md"))
+    candidates = sorted(path for path in source.rglob("*") if path.is_file() and path.name.lower() == "skill.md")
     if not candidates:
         raise ValueError(f"No SKILL.md found under directory: {source}")
     if len(candidates) > 1:
@@ -58,6 +58,16 @@ def resolve_skill_target(skill_path: str) -> tuple[Path, str]:
     return source, str(skill_file.relative_to(source))
 
 
+def _find_direct_skill_file(source: Path) -> Path:
+    direct = source / "SKILL.md"
+    if direct.exists():
+        return direct
+    for child in source.iterdir():
+        if child.is_file() and child.name.lower() == "skill.md":
+            return child
+    return direct
+
+
 def load_skill_definition(
     skill_root: str | Path,
     skill_file: str = "SKILL.md",
@@ -66,9 +76,17 @@ def load_skill_definition(
     root = Path(skill_root).resolve()
     markdown_path = (root / skill_file).resolve()
     if not markdown_path.exists():
-        raise ValueError(f"SKILL.md not found: {markdown_path}")
+        fallback = _find_case_insensitive_skill_file(root, skill_file)
+        if fallback is None:
+            raise ValueError(f"SKILL.md not found: {markdown_path}")
+        markdown_path = fallback
 
     text = markdown_path.read_text(encoding="utf-8")
+    if _looks_like_html_document(text):
+        raise ValueError(
+            "SKILL.md appears to be an HTML page, not the raw Skill markdown. "
+            "Download the raw SKILL.md file or upload the complete Skill directory zip."
+        )
     metadata = _parse_frontmatter(text)
     name = metadata.get("name") or _extract_title(text) or markdown_path.parent.name
     description = metadata.get("description") or _extract_first_paragraph(text)
@@ -93,6 +111,26 @@ def load_skill_definition(
         metadata=metadata,
         raw_markdown=text,
     )
+
+
+def _find_case_insensitive_skill_file(root: Path, skill_file: str) -> Path | None:
+    requested = Path(skill_file)
+    parent = root / requested.parent
+    if not parent.exists() or not parent.is_dir():
+        return None
+    target_name = requested.name.lower()
+    for child in parent.iterdir():
+        if child.is_file() and child.name.lower() == target_name:
+            return child.resolve()
+    return None
+
+
+def _looks_like_html_document(text: str) -> bool:
+    sample = text[:4096].lstrip().lower()
+    if sample.startswith("<!doctype html") or sample.startswith("<html"):
+        return True
+    html_markers = ["<head", "<body", "<script", "<div", "</html>"]
+    return sum(1 for marker in html_markers if marker in sample) >= 3
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:

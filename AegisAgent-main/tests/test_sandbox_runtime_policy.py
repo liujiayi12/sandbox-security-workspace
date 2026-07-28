@@ -7,7 +7,7 @@ from agent_sandbox import sandbox
 from agent_sandbox.adapters import AdapterCandidate
 from agent_sandbox.deployment import BuildOptions, BuildPlan, BuildResult
 from agent_sandbox.real_services import RealServicePreset, selected_real_service_presets, write_real_service_plan
-from agent_sandbox.schemas import AttackStep
+from agent_sandbox.schemas import AttackPlan, AttackStep, ProjectProfile
 
 
 def test_java_runtime_uses_heavier_memory_limit() -> None:
@@ -36,6 +36,47 @@ def test_python_runtime_keeps_default_memory_limit() -> None:
     )
 
     assert sandbox._runtime_memory(adapter) == "768m"
+
+
+def test_dynamic_runtime_prepare_skips_generated_dirs(monkeypatch, tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    workspace = tmp_path / "workspace"
+    (source / "src").mkdir(parents=True)
+    (source / "src" / "agent.py").write_text("print('ok')\n", encoding="utf-8")
+    (source / "build").mkdir()
+    (source / "build" / "generated.js").write_text("generated\n", encoding="utf-8")
+    profile = ProjectProfile(
+        root_name="source",
+        adapter_matches=[
+            AdapterCandidate(
+                name="fake-cli",
+                kind="plan_python",
+                language="Python",
+                framework=None,
+                protocol="cli",
+                image="aegisagent-python:3.12-bookworm",
+                start="python src/agent.py",
+            ).to_dict()
+        ],
+    )
+
+    def fake_try_adapter(root: Path, *_args, **_kwargs):
+        assert (root / "src" / "agent.py").exists()
+        assert not (root / "build").exists()
+        result = sandbox.SandboxResult(status="dynamic_completed", runner="fake-cli")
+        result.adapter = profile.adapter_matches[0]
+        result.build_result = {"status": "built", "image": "agent-sandbox-build:test"}
+        return result
+
+    monkeypatch.setattr(sandbox, "docker_available", lambda: (True, None))
+    monkeypatch.setattr(sandbox, "_try_adapter", fake_try_adapter)
+    monkeypatch.setattr(sandbox, "_prepare_fake_runtime_repo", lambda _root: None)
+
+    result = sandbox.run_dynamic_sandbox(source, workspace, profile, AttackPlan(source="test"), delete_build_image_after_run=False)
+
+    assert result.status == "dynamic_completed"
+    assert result.filesystem_warnings
+    assert result.filesystem_warnings[0]["path"] == "build"
 
 
 def test_http_probe_reports_oom_diagnostics(monkeypatch) -> None:
@@ -299,9 +340,11 @@ def test_runtime_env_accepts_endpoint_and_model_aliases() -> None:
 
 
 def test_fake_environment_runtime_env_exposes_endpoint_aliases() -> None:
-    fake_env = sandbox.FakeEnvironment(network_name="test-network", container_id="test-container")
+    fake_env = sandbox.FakeEnvironment(network_name="test-network", container_id="test-container", ip_address="172.18.0.2")
     env = sandbox._fake_env_runtime_env(fake_env)
 
+    assert env["AGENT_SANDBOX_FAKE_ENV_IP"] == "172.18.0.2"
+    assert sandbox._dns_args("agent-sandbox-net-1", env) == ["--dns", "172.18.0.2"]
     assert env["OPENAI_COMPATIBLE_PROVIDER"] == "OPENAI"
     assert env["OPENAI_URL"] == "http://agent-sandbox-fake-env:8766"
     assert env["OPENAI_API_BASE"] == "http://agent-sandbox-fake-env:8766/v1"

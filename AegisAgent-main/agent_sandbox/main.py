@@ -12,6 +12,12 @@ from fastapi.responses import FileResponse, Response
 from pydantic import ValidationError
 from starlette.staticfiles import StaticFiles
 
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / ".sandbox_data"
+RUNS_DIR = DATA_DIR / "runs"
+
+load_dotenv(BASE_DIR / ".env")
+
 from .attack import default_attack_plan, validate_attack_plan
 from .deployment import image_reserve_status
 from .ingest import IngestError, safe_extract_zip
@@ -23,12 +29,7 @@ from .schemas import LLMProvider, RunSummary
 from .static_scan import scan_project
 from .storage import Store
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / ".sandbox_data"
-RUNS_DIR = DATA_DIR / "runs"
 STORE = Store(DATA_DIR / "runs.sqlite3")
-
-load_dotenv(BASE_DIR / ".env")
 
 app = FastAPI(title="AegisAgent", version="5.0.0")
 WEB_DIR = BASE_DIR / "agent_sandbox" / "web"
@@ -190,8 +191,11 @@ async def process_run(
                 "run_logs": sandbox_result.run_logs,
                 "interactions": sandbox_result.interactions,
                 "file_diff": sandbox_result.file_diff,
+                "repository_status": sandbox_result.repository_status,
                 "canary_hits": sandbox_result.canary_hits,
                 "network_events": sandbox_result.network_events,
+                "filesystem_warnings": sandbox_result.filesystem_warnings,
+                "provenance_seeds": sandbox_result.provenance_seeds,
                 "fake_environment": sandbox_result.fake_environment,
                 "runtime_env_keys": sorted((runtime_env or {}).keys()),
                 "runtime_network": runtime_network,

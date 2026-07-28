@@ -128,6 +128,11 @@ async def plan_builds_with_llm(evidence_bundle: dict[str, Any], providers: list[
             "project_evidence": compact,
             "allowed_protocols": ["cli", "http", "mcp", "browser"],
             "required_fields": ["language", "protocol", "base_image", "install_commands", "start_command", "confidence", "reason"],
+            "build_strategy": {
+                "initial_plan": "Return concise project-native BuildPlan candidates only.",
+                "dependency_policy": "Use manifests, lockfiles, README setup commands, and obvious framework CLIs. Do not add speculative packages.",
+                "failure_feedback": "After a build fails, the sandbox will inspect logs and add concrete BuildPatch items such as missing pip/npm packages, apt packages, tool setup, or lockfile relaxation.",
+            },
         },
         ensure_ascii=False,
     )[:60000]
@@ -136,6 +141,9 @@ async def plan_builds_with_llm(evidence_bundle: dict[str, Any], providers: list[
         "Return strict JSON with a 'plans' array. Each plan may include name, language, framework, "
         "protocol(cli|http|mcp|browser), base_image, install_commands, build_commands, start_command, "
         "port, confidence, and reason. Prefer project-native manifests and documented commands. "
+        "Keep each initial plan minimal and precise: do not broaden it with guessed dependencies, "
+        "alternate reserve images, relaxed lockfile variants, or kitchen-sink setup commands. The sandbox "
+        "will apply structured feedback patches from real build errors. "
         "Do not include secrets. Do not request destructive commands, Docker commands, host mutation, or arbitrary curl-pipe-shell."
     )
     attempts: list[dict[str, Any]] = []

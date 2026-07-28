@@ -85,38 +85,11 @@ def llm_plan_to_candidate(plan: dict[str, Any]) -> AdapterCandidate | None:
 
 
 def expand_candidate_variants(candidate: AdapterCandidate) -> list[AdapterCandidate]:
-    variants = [candidate]
-    relaxed = _relaxed_lockfile_variant(candidate)
-    if relaxed:
-        variants.append(relaxed)
-    language_key = _language_key(candidate.language, candidate.framework)
-    # Build planning already resolves public images to local reserves when possible.
-    # Expanding every candidate into public fallback images makes the sandbox retry
-    # the same entrypoint through slow equivalent base images before trying a
-    # better entrypoint. Keep variants focused on local enhanced reserves.
-    reserve_images = list(image_reserve.LOCAL_RESERVE_IMAGES.get(language_key, []))
-    if not reserve_images and candidate.image:
-        reserve_images = list(image_reserve.PUBLIC_FALLBACK_IMAGES.get(language_key, [])[:1])
-    for image in reserve_images:
-        if image == candidate.image:
-            continue
-        variants.append(
-            AdapterCandidate(
-                name=f"{candidate.name}:image:{_safe_name(image)}",
-                kind=candidate.kind,
-                language=candidate.language,
-                framework=candidate.framework,
-                protocol=candidate.protocol,
-                image=image,
-                install=list(candidate.install),
-                start=candidate.start,
-                port=candidate.port,
-                fake_llm=candidate.fake_llm,
-                confidence=max(0.1, candidate.confidence - 0.03),
-                reason=f"{candidate.reason} Image reserve variant using {image}.",
-            )
-        )
-    return _dedupe(variants)
+    # Variants are intentionally not pre-expanded into progressively broader
+    # plans. The build layer now starts from the concise inferred plan and only
+    # adds packages, tool setup, lockfile relaxation, or reserve-image changes
+    # when a concrete failure log asks for them.
+    return [candidate]
 
 
 def sort_candidate_dicts(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -146,60 +119,6 @@ def _expand_candidate_set(candidates: list[AdapterCandidate]) -> list[AdapterCan
     for candidate in candidates:
         expanded.extend(expand_candidate_variants(candidate))
     return expanded
-
-
-def _relaxed_lockfile_variant(candidate: AdapterCandidate) -> AdapterCandidate | None:
-    if candidate.language != "Node.js" or not candidate.install:
-        return None
-    relaxed = [_relax_lockfile_install_command(command) for command in candidate.install]
-    if relaxed == candidate.install:
-        return None
-    return AdapterCandidate(
-        name=f"{candidate.name}:relaxed-lockfile",
-        kind=candidate.kind,
-        language=candidate.language,
-        framework=candidate.framework,
-        protocol=candidate.protocol,
-        image=candidate.image,
-        install=relaxed,
-        start=candidate.start,
-        port=candidate.port,
-        fake_llm=candidate.fake_llm,
-        confidence=max(0.1, candidate.confidence - 0.015),
-        reason=f"{candidate.reason} Relaxed package-manager lockfile fallback for first-time sandbox builds.",
-    )
-
-
-def _relax_lockfile_install_command(command: str) -> str:
-    command = re.sub(r"\bbun\s+install\b(?P<args>[^&;]*)", _relax_bun_install, command)
-    command = re.sub(r"\bpnpm\s+install\b(?P<args>[^&;]*)", _relax_pnpm_install, command)
-    command = re.sub(r"\byarn\s+install\b(?P<args>[^&;]*)", _relax_yarn_install, command)
-    command = re.sub(r"\bnpm\s+ci\b(?P<args>[^&;]*)", _relax_npm_ci, command)
-    return re.sub(r"\s+", " ", command).strip()
-
-
-def _relax_bun_install(match: re.Match[str]) -> str:
-    args = re.sub(r"\s*--frozen-lockfile\b", "", match.group("args") or "")
-    return f"bun install{args}"
-
-
-def _relax_pnpm_install(match: re.Match[str]) -> str:
-    args = re.sub(r"\s*--frozen-lockfile\b", "", match.group("args") or "")
-    if "--no-frozen-lockfile" not in args:
-        args = f"{args} --no-frozen-lockfile"
-    return f"pnpm install{args}"
-
-
-def _relax_yarn_install(match: re.Match[str]) -> str:
-    args = re.sub(r"\s*--(?:frozen-lockfile|immutable)\b", "", match.group("args") or "")
-    if "--no-immutable" not in args:
-        args = f"{args} --no-immutable"
-    return f"yarn install{args}"
-
-
-def _relax_npm_ci(match: re.Match[str]) -> str:
-    args = match.group("args") or ""
-    return f"npm install{args}"
 
 
 def _langgraph_json_candidates(root: Path) -> list[AdapterCandidate]:

@@ -30,7 +30,7 @@ if [ "$BUILD_IMAGES" = "1" ]; then
       universal) tag="aegisagent-universal:linux" ;;
       *) continue ;;
     esac
-    docker build -t "$tag" -f "$dockerfile" .
+    docker build -t "$tag" "$(dirname "$dockerfile")"
   done
 fi
 

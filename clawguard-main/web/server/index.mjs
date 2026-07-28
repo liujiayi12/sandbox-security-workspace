@@ -38,6 +38,14 @@ import {
   loginUser,
   registerUser,
 } from "./services/authService.mjs";
+import * as fileAuthService from "./services/fileAuthService.mjs";
+import {
+  createInviteCode,
+  disableInviteCode,
+  getInviteUsageByCode,
+  listInviteCodes,
+  updateInviteCode,
+} from "./services/inviteService.mjs";
 import { prisma } from "./lib/prisma.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -45,6 +53,13 @@ const projectRoot = path.resolve(__dirname, "..");
 const distDir = path.join(projectRoot, "dist");
 const indexHtmlPath = path.join(distDir, "index.html");
 const hasBuiltFrontend = fs.existsSync(indexHtmlPath);
+const useFileAuth = String(process.env.AUTH_STORAGE || "file").toLowerCase() !== "database";
+const authService = useFileAuth
+  ? fileAuthService
+  : { getCurrentUserFromRequest, loginUser, registerUser };
+const inviteService = useFileAuth
+  ? fileAuthService
+  : { createInviteCode, disableInviteCode, getInviteUsageByCode, listInviteCodes, updateInviteCode };
 
 const app = express();
 const port = Number(process.env.API_PORT || 8787);
@@ -52,13 +67,47 @@ const port = Number(process.env.API_PORT || 8787);
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: process.env.API_JSON_LIMIT || "75mb" }));
 
+function formatPublicSkillError(error) {
+  const raw = String(error?.message || "").trim();
+  const lower = raw.toLowerCase();
+  const looksGarbled = /�|锟|绋|瀹|æ|å|ä|Â|Ð|Ñ/.test(raw);
+  if (lower.includes("请上传 zip") || lower.includes("填写可下载的 url") || lower.includes("no files")) {
+    return "请先选择要检测的 Skill 文件或压缩包，或填写可直接下载的文件链接。";
+  }
+  if (lower.includes("does not define executable actions") || lower.includes("skill-actions")) {
+    return "已找到 SKILL.md。该 Skill 没有显式 skill-actions，需要按 ClawGuard 动态沙箱的 LLM 运行时执行；请在高级设置中启用 LLM 辅助触发与运行时适配，并填写模型密钥后重试。";
+  }
+  if (lower.includes("llm_config.api_key") || lower.includes("api_key") || lower.includes("api key")) {
+    return "ClawGuard 动态沙箱的 LLM 运行时需要模型密钥。请在 Skill 高级设置中填写智能分析密钥后重试。";
+  }
+  if (lower.includes("html page") || lower.includes("raw skill markdown")) {
+    return "上传的 SKILL.md 看起来是网页 HTML，不是原始 Skill Markdown。请从 GitHub/网页中下载 Raw 原始文件，或上传完整 Skill 目录压缩包。";
+  }
+  if (lower.includes("元数据") || lower.includes("_meta.json") || lower.includes("skill.json")) {
+    return "上传的压缩包只包含 Skill 元数据，没有包含 SKILL.md 正文。请上传完整 Skill 目录压缩包，或直接上传 SKILL.md 文件。";
+  }
+  if (lower.includes("skill.md")) {
+    if (lower.includes("multiple") || lower.includes("多个")) {
+      return "上传内容包含多个 SKILL.md。动态检测一次只支持一个 Skill，请拆分后重新上传。";
+    }
+    return "未在上传内容中找到 SKILL.md。请上传包含 SKILL.md 的完整技能目录压缩包，或直接上传 SKILL.md 文件。";
+  }
+  if (lower.includes("zip") || lower.includes("archive")) {
+    return "上传的压缩包无法识别。请确认文件未损坏，并包含完整的 Skill 目录。";
+  }
+  if (looksGarbled) {
+    return "检测任务未能启动。请确认上传的是有效 Skill 包后重试。";
+  }
+  return raw || "动态沙箱执行失败。";
+}
+
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, now: new Date().toISOString() });
+  res.json({ ok: true, now: new Date().toISOString(), authStorage: useFileAuth ? "file" : "database" });
 });
 
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const data = await registerUser(req.body || {});
+    const data = await authService.registerUser(req.body || {});
     res.json({ ok: true, ...data });
   } catch (error) {
     res.status(400).json({ ok: false, message: error.message || "注册失败。" });
@@ -67,7 +116,7 @@ app.post("/api/auth/register", async (req, res) => {
 
 app.post("/api/auth/login", async (req, res) => {
   try {
-    const data = await loginUser(req.body || {});
+    const data = await authService.loginUser(req.body || {});
     res.json({ ok: true, ...data });
   } catch (error) {
     res.status(400).json({ ok: false, message: error.message || "登录失败。" });
@@ -79,13 +128,97 @@ app.post("/api/auth/logout", (_req, res) => {
 });
 
 app.get("/api/auth/me", async (req, res) => {
-  const user = await getCurrentUserFromRequest(req);
+  const user = await authService.getCurrentUserFromRequest(req);
   if (!user) {
     res.status(401).json({ ok: false, message: "当前未登录或登录已失效。" });
     return;
   }
 
   res.json({ ok: true, user });
+});
+
+async function getAdminUserOrReply(req, res) {
+  const user = await authService.getCurrentUserFromRequest(req);
+  if (!user) {
+    res.status(401).json({ ok: false, message: "请先登录。" });
+    return null;
+  }
+  if (user.role !== "admin") {
+    res.status(403).json({ ok: false, message: "当前账号没有管理员权限。" });
+    return null;
+  }
+  return user;
+}
+
+app.get("/api/admin/invites", async (req, res) => {
+  const user = await getAdminUserOrReply(req, res);
+  if (!user) return;
+
+  try {
+    const invites = await inviteService.listInviteCodes();
+    res.json({ ok: true, invites });
+  } catch (error) {
+    res.status(500).json({ ok: false, message: error.message || "获取邀请码失败。" });
+  }
+});
+
+app.post("/api/admin/invites", async (req, res) => {
+  const user = await getAdminUserOrReply(req, res);
+  if (!user) return;
+
+  try {
+    const invite = await inviteService.createInviteCode({
+      code: req.body?.code,
+      maxUses: req.body?.maxUses || 1,
+      expiresAt: req.body?.expiresAt || null,
+      note: req.body?.note || "",
+      createdBy: user.username || `user-${user.id}`,
+    });
+    res.json({ ok: true, invite });
+  } catch (error) {
+    res.status(400).json({ ok: false, message: error.message || "创建邀请码失败。" });
+  }
+});
+
+app.patch("/api/admin/invites/:code", async (req, res) => {
+  const user = await getAdminUserOrReply(req, res);
+  if (!user) return;
+
+  try {
+    const invite = await inviteService.updateInviteCode(req.params.code, {
+      maxUses: req.body?.maxUses,
+      expiresAt: req.body?.expiresAt,
+      note: req.body?.note,
+      status: req.body?.status,
+    });
+    res.json({ ok: true, invite });
+  } catch (error) {
+    res.status(400).json({ ok: false, message: error.message || "更新邀请码失败。" });
+  }
+});
+
+app.post("/api/admin/invites/:code/disable", async (req, res) => {
+  const user = await getAdminUserOrReply(req, res);
+  if (!user) return;
+
+  try {
+    const invite = await inviteService.disableInviteCode(req.params.code);
+    res.json({ ok: true, invite });
+  } catch (error) {
+    res.status(400).json({ ok: false, message: error.message || "禁用邀请码失败。" });
+  }
+});
+
+app.get("/api/admin/invites/:code/usage", async (req, res) => {
+  const user = await getAdminUserOrReply(req, res);
+  if (!user) return;
+
+  try {
+    const invite = await inviteService.getInviteUsageByCode(req.params.code);
+    res.json({ ok: true, invite });
+  } catch (error) {
+    res.status(400).json({ ok: false, message: error.message || "获取使用记录失败。" });
+  }
 });
 
 app.get("/api/exposure/stats", async (req, res) => {
@@ -233,7 +366,7 @@ app.get("/api/skill/dynamic-sandbox/capacity", (_req, res) => {
 });
 
 app.post("/api/skill/dynamic-sandbox", async (req, res) => {
-  const user = await getCurrentUserFromRequest(req);
+  const user = await authService.getCurrentUserFromRequest(req);
   if (!user) {
     res.status(401).json({ ok: false, code: "LOGIN_REQUIRED", message: "请先登录后再使用动态沙箱检测。" });
     return;
@@ -260,7 +393,7 @@ app.post("/api/skill/dynamic-sandbox", async (req, res) => {
     res.status(500).json({
       ok: false,
       code: error?.code || "SANDBOX_FAILED",
-      message: error?.message || "动态沙箱执行失败。",
+      message: formatPublicSkillError(error),
       capacity: getDynamicSandboxCapacity(),
     });
   }
@@ -288,9 +421,21 @@ if (hasBuiltFrontend) {
   });
 }
 
+if (useFileAuth) {
+  fileAuthService.ensureDefaultAdmin()
+    .then((user) => {
+      if (user) {
+        console.log(`[auth] file auth admin ready: ${user.username}`);
+      }
+    })
+    .catch((error) => {
+      console.error(`[auth] failed to prepare file auth admin: ${error.message || error}`);
+    });
+}
+
 app.listen(port, () => {
   console.log(
-    `[exposure-api] listening on http://127.0.0.1:${port}${hasBuiltFrontend ? " with built frontend" : ""}`
+    `[exposure-api] listening on http://127.0.0.1:${port}${hasBuiltFrontend ? " with built frontend" : ""} (${useFileAuth ? "file auth" : "database auth"})`
   );
 });
 

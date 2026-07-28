@@ -9,6 +9,7 @@ import yaml
 
 from .adapters import detect_adapters
 from .constants import MAX_TEXT_BYTES
+from .fs_utils import safe_walk_files
 from .schemas import Finding, ProjectProfile
 
 TEXT_SUFFIXES = {
@@ -60,7 +61,8 @@ DANGEROUS_PATTERNS: list[tuple[str, str, str, str, re.Pattern[str]]] = [
 
 
 def scan_project(root: Path) -> tuple[ProjectProfile, list[Finding], dict[str, Any]]:
-    files = [path for path in root.rglob("*") if path.is_file()]
+    root = root.resolve()
+    files, filesystem_warnings = safe_walk_files(root)
     rel_files = [path.relative_to(root).as_posix() for path in files]
     profile = ProjectProfile(root_name=root.name)
     profile.manifests = sorted(_find_manifests(rel_files))
@@ -76,7 +78,7 @@ def scan_project(root: Path) -> tuple[ProjectProfile, list[Finding], dict[str, A
     profile.run_candidates = profile.adapter_matches or _build_run_candidates(profile)
     profile.confidence = _confidence(profile)
     findings = _scan_findings(root, files)
-    evidence_bundle = _make_evidence_bundle(root, files, profile, findings)
+    evidence_bundle = _make_evidence_bundle(root, files, profile, findings, filesystem_warnings)
     return profile, findings, evidence_bundle
 
 
@@ -284,7 +286,7 @@ def _scan_findings(root: Path, files: list[Path]) -> list[Finding]:
     return list(findings.values())
 
 
-def _make_evidence_bundle(root: Path, files: list[Path], profile: ProjectProfile, findings: list[Finding]) -> dict[str, Any]:
+def _make_evidence_bundle(root: Path, files: list[Path], profile: ProjectProfile, findings: list[Finding], filesystem_warnings: list[dict[str, str]] | None = None) -> dict[str, Any]:
     interesting_files = []
     for path in files:
         if path.relative_to(root).as_posix() in profile.manifests or Path(path).name.lower() in {"readme.md", "agents.md", "skill.md"}:
@@ -294,6 +296,7 @@ def _make_evidence_bundle(root: Path, files: list[Path], profile: ProjectProfile
         "findings": [finding.model_dump() for finding in findings],
         "interesting_files": interesting_files[:25],
         "source_files": _source_files_for_llm(root, files),
+        "filesystem_warnings": filesystem_warnings or [],
     }
 
 

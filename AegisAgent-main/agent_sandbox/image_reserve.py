@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+
 
 PYTHON_311 = "aegisagent-python:3.12-bookworm"
 PYTHON_312 = "aegisagent-python:3.12-bookworm"
+PYTHON_310_SLIM = "python:3.10-slim"
 NODE_22 = "aegisagent-node:22-bookworm"
 BUN_1 = "oven/bun:1"
 GO_124 = "aegisagent-go:1.24-bookworm"
@@ -49,29 +52,47 @@ DOCKER_REGISTRY_MIRRORS = [
 ]
 
 
+def _configured_mirror_prefixes() -> list[str]:
+    raw = os.getenv("AGENT_SANDBOX_IMAGE_MIRROR_PREFIXES", "")
+    prefixes = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    return prefixes or DOCKERHUB_MIRROR_PREFIXES
+
+
+def _has_configured_mirror_prefixes() -> bool:
+    return bool(os.getenv("AGENT_SANDBOX_IMAGE_MIRROR_PREFIXES", "").strip())
+
+
 def dockerhub_mirror_images(repository: str, tag: str, library: bool = True) -> list[str]:
     repo = f"library/{repository}" if library else repository
-    return [f"{prefix}/{repo}:{tag}" for prefix in DOCKERHUB_MIRROR_PREFIXES]
+    return [f"{prefix}/{repo}:{tag}" for prefix in _configured_mirror_prefixes()]
+
+
+def _ordered_public_images(kind: str, mirrors: list[str]) -> list[str]:
+    official = OFFICIAL_IMAGES[kind]
+    mirrors = [image for image in mirrors if image != official]
+    if _has_configured_mirror_prefixes():
+        return [*mirrors, official]
+    return [official, *mirrors]
 
 
 LOCAL_RESERVE_IMAGES = {
-    "python": [PYTHON_312, PYTHON_311],
+    "python": [PYTHON_312, PYTHON_311, PYTHON_310_SLIM],
     "node": [NODE_22],
     "bun": [BUN_1],
     "go": [GO_125, GO_124],
     "rust": [RUST_1],
     "java": [JAVA_21],
-    "shell": [UNIVERSAL, SHELL_BASH],
-    "custom": [UNIVERSAL],
+    "shell": [UNIVERSAL, SHELL_BASH, PYTHON_310_SLIM],
+    "custom": [UNIVERSAL, PYTHON_310_SLIM],
 }
 
 PUBLIC_FALLBACK_IMAGES = {
-    "python": [*dockerhub_mirror_images("python", "3.12-slim"), OFFICIAL_IMAGES["python"]],
-    "node": [*dockerhub_mirror_images("node", "22-bookworm"), OFFICIAL_IMAGES["node"]],
-    "bun": [*dockerhub_mirror_images("oven/bun", "1", library=False), OFFICIAL_IMAGES["bun"]],
-    "go": [*dockerhub_mirror_images("golang", "1.25-bookworm"), OFFICIAL_IMAGES["go"]],
-    "rust": [*dockerhub_mirror_images("rust", "1-bookworm"), OFFICIAL_IMAGES["rust"]],
-    "java": [*dockerhub_mirror_images("maven", "3.9-eclipse-temurin-21"), OFFICIAL_IMAGES["java"]],
-    "shell": [*dockerhub_mirror_images("bash", "5.2"), SHELL_BASH],
-    "custom": [MIRROR_IMAGES["universal"], OFFICIAL_IMAGES["universal"]],
+    "python": _ordered_public_images("python", dockerhub_mirror_images("python", "3.12-slim")),
+    "node": _ordered_public_images("node", dockerhub_mirror_images("node", "22-bookworm")),
+    "bun": _ordered_public_images("bun", dockerhub_mirror_images("oven/bun", "1", library=False)),
+    "go": _ordered_public_images("go", dockerhub_mirror_images("golang", "1.25-bookworm")),
+    "rust": _ordered_public_images("rust", dockerhub_mirror_images("rust", "1-bookworm")),
+    "java": _ordered_public_images("java", dockerhub_mirror_images("maven", "3.9-eclipse-temurin-21")),
+    "shell": _ordered_public_images("shell", dockerhub_mirror_images("bash", "5.2")),
+    "custom": _ordered_public_images("universal", [MIRROR_IMAGES["universal"]]),
 }

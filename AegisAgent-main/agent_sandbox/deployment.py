@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 import textwrap
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,42 @@ class BuildOptions:
     build_mode: str = "auto"
     allow_install_scripts: bool = True
     cache_policy: str = "use"
+    max_build_attempts: int = 5
+
+
+@dataclass
+class BuildPatch:
+    add_system_packages: list[str] = field(default_factory=list)
+    add_python_packages: list[str] = field(default_factory=list)
+    add_node_packages: list[str] = field(default_factory=list)
+    add_go_commands: list[str] = field(default_factory=list)
+    add_rust_commands: list[str] = field(default_factory=list)
+    add_java_commands: list[str] = field(default_factory=list)
+    append_install_commands: list[str] = field(default_factory=list)
+    relax_lockfile: bool = False
+    switch_base_image: str | None = None
+    start_command_override: str | None = None
+    reason: str = ""
+    source: str = "rules"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def is_empty(self) -> bool:
+        return not any(
+            (
+                self.add_system_packages,
+                self.add_python_packages,
+                self.add_node_packages,
+                self.add_go_commands,
+                self.add_rust_commands,
+                self.add_java_commands,
+                self.append_install_commands,
+                self.relax_lockfile,
+                self.switch_base_image,
+                self.start_command_override,
+            )
+        )
 
 
 @dataclass
@@ -65,6 +101,7 @@ class BuildPlan:
     confidence: float = 0.0
     reason: str = ""
     image_resolution: dict[str, Any] = field(default_factory=dict)
+    build_patches: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,16 +118,25 @@ class BuildResult:
     failure_class: str | None = None
     human_reason: str | None = None
     suggested_fix: str | None = None
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+    applied_patches: list[dict[str, Any]] = field(default_factory=list)
+    final_plan: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 def normalize_build_options(build_mode: str = "auto", allow_install_scripts: bool = True, cache_policy: str = "use") -> BuildOptions:
+    max_attempts = os.getenv("AGENT_SANDBOX_MAX_BUILD_ATTEMPTS", "5")
+    try:
+        max_build_attempts = max(1, min(10, int(max_attempts)))
+    except ValueError:
+        max_build_attempts = 5
     return BuildOptions(
         build_mode=build_mode if build_mode in {"auto", "strict", "sandbox_yaml_only"} else "auto",
         allow_install_scripts=bool(allow_install_scripts),
         cache_policy=cache_policy if cache_policy in {"use", "rebuild", "disabled"} else "use",
+        max_build_attempts=max_build_attempts,
     )
 
 
@@ -141,6 +187,62 @@ def create_build_plan(root: Path, adapter: AdapterCandidate, options: BuildOptio
 
 def build_environment(root: Path, plan: BuildPlan, options: BuildOptions | None = None) -> BuildResult:
     options = options or BuildOptions()
+    if options.build_mode == "auto" and plan.source != "dockerfile":
+        result = _build_environment_progressive(root, plan, options)
+    else:
+        result = _build_environment_once(root, plan, options)
+    if result.final_plan is None:
+        result.final_plan = plan.to_dict()
+    return result
+
+
+def _build_environment_progressive(root: Path, plan: BuildPlan, options: BuildOptions) -> BuildResult:
+    attempts: list[dict[str, Any]] = []
+    applied: list[BuildPatch] = []
+    current = plan
+    max_attempts = max(1, min(10, options.max_build_attempts))
+    last_result: BuildResult | None = None
+    seen_patches: set[str] = set()
+    for attempt_index in range(1, max_attempts + 1):
+        result = _build_environment_once(root, current, options)
+        last_result = result
+        attempts.append(
+            {
+                "attempt": attempt_index,
+                "plan_id": current.plan_id,
+                "cache_key": current.cache_key,
+                "base_image": current.base_image,
+                "status": result.status,
+                "failure_class": result.failure_class,
+                "patches_applied": [patch.to_dict() for patch in applied],
+            }
+        )
+        if result.status in {"built", "cached"} and result.image:
+            result.attempts = attempts
+            result.applied_patches = [patch.to_dict() for patch in applied]
+            result.final_plan = current.to_dict()
+            return result
+        patch = build_patch_from_failure(root, current, result, applied)
+        if patch is None or patch.is_empty():
+            break
+        patch_key = _patch_key(patch)
+        if patch_key in seen_patches:
+            break
+        seen_patches.add(patch_key)
+        applied.append(patch)
+        current = apply_build_patches(root, plan, applied)
+    if last_result is None:
+        return _build_environment_once(root, plan, options)
+    last_result.attempts = attempts
+    last_result.applied_patches = [patch.to_dict() for patch in applied]
+    last_result.final_plan = current.to_dict()
+    if attempts and len(attempts) >= max_attempts and last_result.status == "failed":
+        last_result.suggested_fix = f"{last_result.suggested_fix or 'Inspect build logs.'} Progressive build reached the maximum attempt count ({max_attempts})."
+    return last_result
+
+
+def _build_environment_once(root: Path, plan: BuildPlan, options: BuildOptions | None = None) -> BuildResult:
+    options = options or BuildOptions()
     started = time.time()
     if plan.base_image == "unsupported":
         return BuildResult(status="skipped", duration_seconds=0.0, failure_stage="build_plan", failure_class="unsupported_project", human_reason=plan.reason, suggested_fix="Add sandbox.yaml with image, install/build, start, and protocol.")
@@ -175,6 +277,360 @@ def build_environment(root: Path, plan: BuildPlan, options: BuildOptions | None 
     _remember_image_exists(plan.cache_image, True)
     _prune_cache(keep_image=plan.cache_image)
     return BuildResult(status="built", cache_hit=False, image=plan.cache_image, logs=[log], duration_seconds=time.time() - started)
+
+
+def build_patch_from_failure(root: Path, plan: BuildPlan, result: BuildResult, applied: list[BuildPatch] | None = None) -> BuildPatch | None:
+    applied = applied or []
+    text = _build_failure_text(result)
+    lowered = text.lower()
+    patch = BuildPatch(reason=result.human_reason or result.failure_class or "Build failed.", source="rules")
+    if result.failure_class == "network_timeout" or result.failure_class == "auth_required":
+        next_image = _next_base_image_candidate(plan, applied, text)
+        if next_image:
+            patch.switch_base_image = next_image
+            patch.reason = f"Base image {plan.base_image} was unavailable; retry with {next_image}."
+            return patch
+        return None
+    if result.failure_class == "lockfile_conflict" or _looks_like_lockfile_conflict(lowered):
+        patch.relax_lockfile = True
+        patch.reason = "Package lockfile appears out of sync; retry with relaxed lockfile enforcement."
+    _add_missing_python_packages(patch, text, plan)
+    _add_missing_node_packages(patch, text, plan)
+    _add_missing_system_packages(patch, text)
+    _add_missing_tool_commands(patch, text, plan)
+    _add_browser_recovery(patch, text, plan)
+    _add_language_specific_recovery(patch, text, plan)
+    patch = _remove_already_applied_patch_items(patch, applied)
+    return None if patch.is_empty() else patch
+
+
+def apply_build_patches(root: Path, base_plan: BuildPlan, patches: list[BuildPatch]) -> BuildPlan:
+    plan = replace(
+        base_plan,
+        install_commands=list(base_plan.install_commands),
+        build_commands=list(base_plan.build_commands),
+        build_patches=[patch.to_dict() for patch in patches],
+    )
+    for patch in patches:
+        if patch.switch_base_image:
+            plan.base_image = patch.switch_base_image
+            plan.image_resolution = {
+                **(plan.image_resolution or {}),
+                "selected_image": patch.switch_base_image,
+                "selected_layer": "retry_public_fallback",
+                "requires_public_pull": not _image_exists(patch.switch_base_image),
+                "reason": patch.reason,
+            }
+        if patch.relax_lockfile:
+            plan.install_commands = [_relax_lockfile_command(command) for command in plan.install_commands]
+        if patch.add_system_packages:
+            command = _system_package_command(patch.add_system_packages, plan.base_image)
+            plan.install_commands = _prepend_unique_command(plan.install_commands, command)
+        if patch.add_python_packages:
+            plan.install_commands = _append_unique_command(plan.install_commands, _python_package_command(plan, patch.add_python_packages))
+        if patch.add_node_packages:
+            plan.install_commands = _append_unique_command(plan.install_commands, _node_package_command(plan, patch.add_node_packages))
+        for command in [*patch.add_go_commands, *patch.add_rust_commands, *patch.add_java_commands, *patch.append_install_commands]:
+            plan.install_commands = _append_unique_command(plan.install_commands, command)
+        if patch.start_command_override:
+            plan.start_command = patch.start_command_override
+    plan.install_commands = _normalize_commands_for_image(plan.install_commands, plan.base_image)
+    plan.build_commands = _normalize_commands_for_image(plan.build_commands, plan.base_image)
+    patch_reasons = "; ".join(patch.reason for patch in patches if patch.reason)
+    if patch_reasons:
+        plan.reason = f"{base_plan.reason} Progressive patches: {patch_reasons}"[:1200]
+    plan.cache_key = _cache_key(root, plan)
+    plan.plan_id = plan.cache_key[:16]
+    plan.cache_image = f"{CACHE_PREFIX}:{plan.cache_key[:24]}"
+    return plan
+
+
+def _build_failure_text(result: BuildResult) -> str:
+    parts = [result.failure_class or "", result.human_reason or "", result.suggested_fix or ""]
+    for log in result.logs:
+        parts.extend(str(log.get(key) or "") for key in ("stdout", "stderr", "error", "body_preview"))
+    return "\n".join(parts)
+
+
+def _next_base_image_candidate(plan: BuildPlan, applied: list[BuildPatch], text: str) -> str | None:
+    if not _looks_like_base_image_resolution_failure(text):
+        return None
+    attempted = {plan.base_image}
+    attempted.update(patch.switch_base_image for patch in applied if patch.switch_base_image)
+    candidates = []
+    resolution = plan.image_resolution if isinstance(plan.image_resolution, dict) else {}
+    candidates.extend(str(item) for item in resolution.get("public_fallback_candidates") or [])
+    candidates.extend(image_reserve.PUBLIC_FALLBACK_IMAGES.get(_language_key(plan.language, plan.framework), []))
+    for candidate in _unique([item for item in candidates if item]):
+        if candidate not in attempted:
+            return candidate
+    return None
+
+
+def _looks_like_base_image_resolution_failure(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "load metadata for",
+            "failed to resolve source metadata",
+            "head request",
+            "manifest",
+            "pull access denied",
+            "401 unauthorized",
+            "tls handshake timeout",
+        )
+    )
+
+
+def _looks_like_lockfile_conflict(text: str) -> bool:
+    return any(token in text for token in ("frozen-lockfile", "lockfile is up to date", "package-lock.json is out of sync", "yarn.lock", "--immutable"))
+
+
+def _add_missing_python_packages(patch: BuildPatch, text: str, plan: BuildPlan) -> None:
+    if plan.language != "Python":
+        return
+    packages: list[str] = []
+    for module in re.findall(r"(?:ModuleNotFoundError|ImportError).*?(?:No module named|named)\s+['\"]([^'\"]+)['\"]", text, re.I):
+        package = _python_package_for_module(module)
+        if package:
+            packages.append(package)
+    for module in re.findall(r"ModuleNotFoundError:\s+No module named\s+([A-Za-z0-9_.-]+)", text, re.I):
+        package = _python_package_for_module(module)
+        if package:
+            packages.append(package)
+    if _uses_legacy_openai_api(text) and not any("openai<1" in command for command in plan.install_commands):
+        packages.append("openai<1")
+    if packages:
+        patch.add_python_packages.extend(_unique(packages))
+        patch.reason = f"Missing Python modules detected: {', '.join(_unique(packages))}."
+
+
+def _python_package_for_module(module: str) -> str | None:
+    module = module.split(".", 1)[0].replace("-", "_")
+    mapping = {
+        "yaml": "PyYAML",
+        "dotenv": "python-dotenv",
+        "cv2": "opencv-python-headless",
+        "PIL": "Pillow",
+        "bs4": "beautifulsoup4",
+        "sklearn": "scikit-learn",
+        "langchain_openai": "langchain-openai",
+        "langchain_anthropic": "langchain-anthropic",
+        "langchain_community": "langchain-community",
+        "crewai_tools": "crewai-tools",
+        "pydantic_settings": "pydantic-settings",
+        "duckduckgo_search": "duckduckgo-search",
+    }
+    if module in mapping:
+        return mapping[module]
+    if re.match(r"^[A-Za-z][A-Za-z0-9_]{1,60}$", module):
+        return module.replace("_", "-")
+    return None
+
+
+def _add_missing_node_packages(patch: BuildPatch, text: str, plan: BuildPlan) -> None:
+    if plan.language != "Node.js":
+        return
+    packages = []
+    for module in re.findall(r"Cannot find module ['\"]([^'\"]+)['\"]", text, re.I):
+        if module.startswith((".", "/", "node:")):
+            continue
+        packages.append(_node_package_for_module(module))
+    if packages:
+        patch.add_node_packages.extend(_unique(packages))
+        patch.reason = f"Missing Node modules detected: {', '.join(_unique(packages))}."
+
+
+def _node_package_for_module(module: str) -> str:
+    if module.startswith("@"):
+        parts = module.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else module
+    return module.split("/", 1)[0]
+
+
+def _add_missing_system_packages(patch: BuildPatch, text: str) -> None:
+    lowered = text.lower()
+    packages: list[str] = []
+    header_map = {
+        "sqlite3.h": "libsqlite3-dev",
+        "openssl/ssl.h": "libssl-dev",
+        "ffi.h": "libffi-dev",
+        "python.h": "python3-dev",
+        "zlib.h": "zlib1g-dev",
+        "jpeglib.h": "libjpeg-dev",
+        "png.h": "libpng-dev",
+        "libpq-fe.h": "libpq-dev",
+        "mysql.h": "default-libmysqlclient-dev",
+        "sndfile.h": "libsndfile1-dev",
+        "portaudio.h": "portaudio19-dev",
+        "x11/xlib.h": "libx11-dev",
+    }
+    for marker, package in header_map.items():
+        if marker in lowered:
+            packages.append(package)
+    marker_map = {
+        "dbus-1": "libdbus-1-dev",
+        "pkg-config": "pkg-config",
+        "gcc: not found": "build-essential",
+        "g++: not found": "build-essential",
+        "make: not found": "make",
+        "cmake: not found": "cmake",
+        "clang: not found": "clang",
+    }
+    for marker, package in marker_map.items():
+        if marker in lowered:
+            packages.append(package)
+    if "fatal error:" in lowered and (".h:" in lowered or "no such file" in lowered):
+        packages.append("build-essential")
+    if packages:
+        patch.add_system_packages.extend(_unique(packages))
+        patch.reason = f"Missing system packages detected: {', '.join(_unique(packages))}."
+
+
+def _add_missing_tool_commands(patch: BuildPatch, text: str, plan: BuildPlan) -> None:
+    lowered = text.lower()
+    if plan.language == "Node.js":
+        if re.search(r"\bpnpm(?:\s*:\s+|\s+)not found|pnpm: command not found", lowered):
+            patch.append_install_commands.append("corepack enable")
+            patch.relax_lockfile = True
+            patch.reason = "pnpm was missing; retry after enabling corepack."
+        if re.search(r"\byarn(?:\s*:\s+|\s+)not found|yarn: command not found", lowered):
+            patch.append_install_commands.append("corepack enable")
+            patch.relax_lockfile = True
+            patch.reason = "yarn was missing; retry after enabling corepack."
+    if plan.language == "Java":
+        if re.search(r"\bgradle(?:\s*:\s+|\s+)not found|gradle: command not found", lowered):
+            patch.add_system_packages.append("gradle")
+            patch.reason = "Gradle was missing from the selected build image."
+
+
+def _add_browser_recovery(patch: BuildPatch, text: str, plan: BuildPlan) -> None:
+    lowered = text.lower()
+    if not any(token in lowered for token in ("chromium", "playwright", "selenium", "browser executable", "chrome executable")):
+        return
+    browser_packages = [
+        "libnss3",
+        "libatk-bridge2.0-0",
+        "libgtk-3-0",
+        "libgbm1",
+        "libasound2",
+        "fonts-liberation",
+    ]
+    patch.add_system_packages.extend(browser_packages)
+    if plan.language == "Python":
+        patch.append_install_commands.append("/opt/agent-venv/bin/python -m playwright install chromium || true")
+    elif plan.language == "Node.js":
+        patch.append_install_commands.append("npx playwright install chromium || true")
+    if len([item for p in (plan.build_patches or []) for item in p.get("add_system_packages", []) if item in browser_packages]) >= 3:
+        patch.switch_base_image = image_reserve.UNIVERSAL
+    patch.reason = "Browser or Playwright runtime dependencies appear to be missing."
+
+
+def _add_language_specific_recovery(patch: BuildPatch, text: str, plan: BuildPlan) -> None:
+    lowered = text.lower()
+    if plan.language == "Rust" and ("openssl" in lowered or "sqlite" in lowered or "dbus" in lowered):
+        if "openssl" in lowered:
+            patch.add_system_packages.append("libssl-dev")
+        if "sqlite" in lowered:
+            patch.add_system_packages.append("libsqlite3-dev")
+        if "dbus" in lowered:
+            patch.add_system_packages.append("libdbus-1-dev")
+    if plan.language == "Go" and ("cgo" in lowered or "gcc" in lowered):
+        patch.add_system_packages.extend(["build-essential", "pkg-config"])
+
+
+def _remove_already_applied_patch_items(patch: BuildPatch, applied: list[BuildPatch]) -> BuildPatch:
+    seen = BuildPatch()
+    for item in applied:
+        seen.add_system_packages.extend(item.add_system_packages)
+        seen.add_python_packages.extend(item.add_python_packages)
+        seen.add_node_packages.extend(item.add_node_packages)
+        seen.add_go_commands.extend(item.add_go_commands)
+        seen.add_rust_commands.extend(item.add_rust_commands)
+        seen.add_java_commands.extend(item.add_java_commands)
+        seen.append_install_commands.extend(item.append_install_commands)
+    patch.add_system_packages = [item for item in _unique(patch.add_system_packages) if item not in seen.add_system_packages]
+    patch.add_python_packages = [item for item in _unique(patch.add_python_packages) if item not in seen.add_python_packages]
+    patch.add_node_packages = [item for item in _unique(patch.add_node_packages) if item not in seen.add_node_packages]
+    patch.add_go_commands = [item for item in _unique(patch.add_go_commands) if item not in seen.add_go_commands]
+    patch.add_rust_commands = [item for item in _unique(patch.add_rust_commands) if item not in seen.add_rust_commands]
+    patch.add_java_commands = [item for item in _unique(patch.add_java_commands) if item not in seen.add_java_commands]
+    patch.append_install_commands = [item for item in _unique(patch.append_install_commands) if item not in seen.append_install_commands]
+    if patch.relax_lockfile and any(item.relax_lockfile for item in applied):
+        patch.relax_lockfile = False
+    if patch.switch_base_image and any(item.switch_base_image == patch.switch_base_image for item in applied):
+        patch.switch_base_image = None
+    return patch
+
+
+def _system_package_command(packages: list[str], base_image: str) -> str:
+    packages = _unique(packages)
+    if _is_alpine_like_image(base_image):
+        return f"apk add --no-cache {' '.join(packages)}"
+    return f"apt-get update && apt-get install -y --no-install-recommends {' '.join(packages)}"
+
+
+def _python_package_command(plan: BuildPlan, packages: list[str]) -> str:
+    python = "/opt/agent-venv/bin/python" if any("/opt/agent-venv" in command for command in plan.install_commands) else "python"
+    return f"{python} -m pip install {' '.join(_shell_quote_package(package) for package in _unique(packages))}"
+
+
+def _node_package_command(plan: BuildPlan, packages: list[str]) -> str:
+    package_args = " ".join(_shell_quote_package(package) for package in _unique(packages))
+    install_text = "\n".join(plan.install_commands).lower()
+    if "pnpm " in install_text:
+        return f"pnpm add --prefer-offline {package_args}"
+    if "yarn " in install_text:
+        return f"yarn add {package_args}"
+    if "bun " in install_text:
+        return f"bun add {package_args}"
+    return f"npm install --prefer-offline --no-save {package_args}"
+
+
+def _shell_quote_package(package: str) -> str:
+    if re.match(r"^[A-Za-z0-9_./@:<>=~!+-]+$", package):
+        return package
+    return repr(package)
+
+
+def _relax_lockfile_command(command: str) -> str:
+    lowered = command.lower()
+    if "npm ci" in lowered:
+        return re.sub(r"\bnpm\s+ci\b", "npm install", command, count=1)
+    if "pnpm install" in lowered:
+        command = re.sub(r"\s*--frozen-lockfile\b", "", command)
+        return command if "--no-frozen-lockfile" in command else f"{command} --no-frozen-lockfile"
+    if "yarn install" in lowered:
+        command = re.sub(r"\s*--(?:frozen-lockfile|immutable)\b", "", command)
+        return command
+    if "bun install" in lowered:
+        return re.sub(r"\s*--frozen-lockfile\b", "", command)
+    return command
+
+
+def _prepend_unique_command(commands: list[str], command: str) -> list[str]:
+    return commands if command in commands else [command, *commands]
+
+
+def _append_unique_command(commands: list[str], command: str) -> list[str]:
+    return commands if command in commands else [*commands, command]
+
+
+def _unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        item = str(item).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _patch_key(patch: BuildPatch) -> str:
+    return json.dumps(patch.to_dict(), sort_keys=True)
 
 
 def classify_build_failure(text: str) -> tuple[str, str, str]:
@@ -1393,9 +1849,32 @@ def _run_docker_build(
         return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr), False, elapsed
     except subprocess.TimeoutExpired:
         _terminate_process_tree(proc)
-        stdout, stderr = proc.communicate(timeout=20)
+        stdout, stderr = _communicate_after_termination(proc)
         elapsed = time.time() - started
         return subprocess.CompletedProcess(command, -1, stdout, stderr), True, elapsed
+
+
+def _communicate_after_termination(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        return proc.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        return "", ""
 
 
 def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
@@ -1403,6 +1882,11 @@ def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
         return
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
         return
     os.killpg(proc.pid, signal.SIGKILL)
 

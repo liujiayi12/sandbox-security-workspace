@@ -22,6 +22,21 @@ The 5.0 focus is layered agent adaptation and evaluation: AegisAgent combines ev
 - Git is optional for ordinary use, but useful when testing agents that depend on
   Git metadata or Git-based workflows.
 
+## Install From GitHub
+
+Clone the public repository:
+
+```bash
+git clone https://github.com/VVAN-L/AegisAgent.git
+cd AegisAgent
+```
+
+No real API key is committed to this repository. If you want optional LLM
+assistance, copy `.env.example` to `.env` and fill in your own provider, model,
+base URL, and key. If you leave the key fields blank, AegisAgent still performs
+rule-based static scanning, adapter discovery, default dynamic attacks, fake
+environment tests, and Markdown report generation.
+
 ## Quick Start
 
 Windows PowerShell:
@@ -45,6 +60,13 @@ settings, LLM-assistance toggles, network policy, build policy, and whether to
 delete first-level build images after the run. The UI renders a user-facing
 Markdown report after completion and can download the same report as `.md`.
 
+For a development install that can also run tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+pytest -q
+```
+
 ## Manual Start
 
 ```powershell
@@ -61,6 +83,37 @@ Open `http://127.0.0.1:8000` for the web UI or
 AegisAgent can run with official public base images, but dynamic compatibility
 is better when the second-layer reserve images are available locally.
 
+The reserve is optional, but recommended before scanning many agents. These
+images are built on your machine and are not uploaded to GitHub:
+
+- First-level images: per-agent `agent-sandbox-build:*` dependency images. They
+  are temporary and can be deleted after each run.
+- Second-level images: reusable `aegisagent-*` language images. Keep these
+  locally; they reduce repeated dependency/build failures.
+- Third-level images: public upstream images or mirrored public image names used
+  only when the local reserve is missing.
+
+Pull the maintained second-layer reserve images from GitHub Container Registry:
+
+```powershell
+docker pull ghcr.io/vvan-l/aegisagent-python:3.12-bookworm
+docker pull ghcr.io/vvan-l/aegisagent-node:22-bookworm
+docker pull ghcr.io/vvan-l/aegisagent-go:1.24-bookworm
+docker pull ghcr.io/vvan-l/aegisagent-go:1.25-bookworm
+docker pull ghcr.io/vvan-l/aegisagent-rust:1-bookworm
+docker pull ghcr.io/vvan-l/aegisagent-java:21-bookworm
+docker pull ghcr.io/vvan-l/aegisagent-universal:linux
+
+docker tag ghcr.io/vvan-l/aegisagent-python:3.12-bookworm aegisagent-python:3.12-bookworm
+docker tag ghcr.io/vvan-l/aegisagent-node:22-bookworm aegisagent-node:22-bookworm
+docker tag ghcr.io/vvan-l/aegisagent-go:1.24-bookworm aegisagent-go:1.24-bookworm
+docker tag ghcr.io/vvan-l/aegisagent-go:1.25-bookworm aegisagent-go:1.25-bookworm
+docker tag ghcr.io/vvan-l/aegisagent-rust:1-bookworm aegisagent-rust:1-bookworm
+docker tag ghcr.io/vvan-l/aegisagent-java:21-bookworm aegisagent-java:21-bookworm
+docker tag ghcr.io/vvan-l/aegisagent-universal:linux aegisagent-universal:linux
+```
+
+If GHCR is unavailable from your network, build the images locally instead.
 Build all enhanced images:
 
 ```powershell
@@ -73,6 +126,71 @@ Or install dependencies and build images in one step:
 powershell -ExecutionPolicy Bypass -File scripts/setup.ps1 -BuildImages
 ```
 
+Build only one language image:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File docker/images/scripts/build.ps1 -Name python
+powershell -ExecutionPolicy Bypass -File docker/images/scripts/build.ps1 -Name node
+powershell -ExecutionPolicy Bypass -File docker/images/scripts/build.ps1 -Name go
+powershell -ExecutionPolicy Bypass -File docker/images/scripts/build.ps1 -Name java
+```
+
+Check whether the reserve is ready after the server starts:
+
+```powershell
+curl http://127.0.0.1:8000/api/image-reserve
+```
+
+### Docker Registry Mirror
+
+`setup.ps1` and `setup.sh` do not modify Docker Desktop or system daemon
+settings automatically. If Docker Hub pulls are slow or timing out, configure a
+registry mirror before building images.
+
+Docker Desktop on Windows:
+
+1. Open Docker Desktop.
+2. Go to Settings -> Docker Engine.
+3. Add or merge a `registry-mirrors` list.
+4. Apply and restart Docker Desktop.
+
+Example shape:
+
+```json
+{
+  "registry-mirrors": [
+    "https://your-reachable-docker-mirror.example"
+  ]
+}
+```
+
+Linux Docker Engine:
+
+```bash
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+{
+  "registry-mirrors": [
+    "https://your-reachable-docker-mirror.example"
+  ]
+}
+JSON
+sudo systemctl restart docker
+```
+
+Use a mirror that is reachable from your network. Mirror availability changes
+over time, so verify with:
+
+```powershell
+docker pull python:3.12-bookworm
+docker pull node:22-bookworm
+```
+
+The project Dockerfiles and generated build plans also configure package-level
+accelerators for apt, pip, npm, Go modules, Maven/Gradle, and Cargo where
+possible. Docker registry mirrors are still useful because they speed up the
+base image pull that happens before those package-level settings can run.
+
 ## API
 
 - `POST /api/runs`: upload a zip. Required form field: `file`.
@@ -84,7 +202,7 @@ Optional `POST /api/runs` form fields:
 
 - `providers`: JSON array of LLM providers for sandbox-side audit/planning.
 - `runtime_env`: JSON object of environment variables for the tested agent.
-- `runtime_network`: `auto`, `none`, or `bridge`; default `auto`. In auto mode, runtime model credentials or provider base URLs enable `bridge`, otherwise runtime remains `none`.
+- `runtime_network`: `auto`, `sandbox`, `none`, or `bridge`; default `auto`. In auto mode, runtime model credentials or provider base URLs enable `bridge`; otherwise runtime uses the sandbox-private fake environment.
 - `build_mode`: `auto`, `strict`, or `sandbox_yaml_only`; default `auto`.
 - `allow_install_scripts`: default `true`.
 - `cache_policy`: `use`, `rebuild`, or `disabled`; default `use`.
@@ -143,6 +261,13 @@ SANDBOX_RUNTIME_NETWORK=auto
 ```
 
 `SANDBOX_LLM_*` is for AegisAgent itself. `SANDBOX_RUNTIME_*` is for the untrusted agent being tested.
+
+Recommended modes:
+
+- No API key: choose provider "None" in the UI or leave `.env` blank. Static scanning, adapter discovery, fake environment tests, and Markdown reports still work.
+- LLM-assisted sandbox review: set `SANDBOX_LLM_*` or fill the provider fields in the UI. The key is used by AegisAgent, not baked into Docker build images.
+- Real agent conversation test: set `runtime_env` or `SANDBOX_RUNTIME_*` and use `runtime_network=bridge`. Use temporary, low-privilege keys.
+- Fake-environment attack test: use `runtime_network=sandbox`. This lets the agent reach fake web/email/GitHub/RAG/MCP/sink services but blocks public internet access.
 
 ## Dynamic Runtime
 
@@ -233,6 +358,7 @@ Important tags:
 - `aegisagent-python:3.12-bookworm`
 - `aegisagent-node:22-bookworm`
 - `aegisagent-go:1.24-bookworm`
+- `aegisagent-go:1.25-bookworm` if you built or restored the Go 1.25 reserve for newer Go projects
 - `aegisagent-rust:1-bookworm`
 - `aegisagent-java:21-bookworm`
 - `aegisagent-universal:linux`
@@ -256,6 +382,11 @@ Reports include:
 - Default attack plan and observed evidence.
 - Canary hits, file diffs, network intent, and runtime API-key requirements.
 - Separate handling for sandbox failures and tested-agent application errors.
+- A user-facing Markdown report shown directly in the web UI and downloadable as `.md`.
+- Provenance coverage for configuration/repository/dependency changes, natural-language-triggered commands, MCP lineage, LLM key usage, unrelated credential access, CI release behavior, and high-entropy DNS signals.
+
+Reports and run workspaces are local runtime data under `.sandbox_data/` and are
+ignored by Git.
 
 ## Vulnerability Discovery Evaluation
 
@@ -293,3 +424,17 @@ The public repository keeps:
 Local-only directories ignored by Git include `real_samples/`,
 `research_repos/`, `.sandbox_data/`, `.venv/`, and generated build/test caches.
 See `SOURCES.md` for URLs and local material notes.
+
+## Disk Cleanup
+
+Large scans create first-level Docker images and run workspaces. To save disk
+space without removing source code:
+
+```powershell
+docker image prune
+docker builder prune
+Remove-Item -Recurse -Force .sandbox_data
+```
+
+Keep the second-layer `aegisagent-*` images if you plan to continue dynamic
+testing. They are the reusable reserve layer that reduces slow public pulls.

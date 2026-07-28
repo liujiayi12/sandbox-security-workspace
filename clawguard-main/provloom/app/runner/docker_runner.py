@@ -44,6 +44,12 @@ class DockerRunner:
         # Docker bind mounts require absolute host paths for reproducible benchmark runs.
         self.artifacts_root = Path(artifacts_root).resolve()
         self.artifacts_root.mkdir(parents=True, exist_ok=True)
+        self.docker_config_dir = Path(
+            os.environ.get("PROVLOOM_DOCKER_CONFIG")
+            or self.artifacts_root.parent / "docker-config"
+        ).resolve()
+        self.docker_config_dir.mkdir(parents=True, exist_ok=True)
+        self._prepare_docker_config()
 
     def run(
         self,
@@ -77,6 +83,9 @@ class DockerRunner:
             mounted_skill_dir = temp_root / "skill"
             artifacts_dir = self.artifacts_root / execution_id
             shutil.copytree(source_dir, mounted_skill_dir)
+            mounted_skill_file = mounted_skill_dir / skill_file
+            mounted_skill_file.parent.mkdir(parents=True, exist_ok=True)
+            mounted_skill_file.write_text(skill_definition.raw_markdown, encoding="utf-8")
             if artifacts_dir.exists():
                 shutil.rmtree(artifacts_dir)
             artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +94,7 @@ class DockerRunner:
                 json.dumps(input_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            (artifacts_dir / "skill-entry.md").write_text(skill_definition.raw_markdown, encoding="utf-8")
             (artifacts_dir / "llm-config.json").write_text(
                 json.dumps({
                     "enabled": llm_config.enabled,
@@ -142,6 +152,7 @@ class DockerRunner:
             )
 
             runner_script = self._build_runner_script(skill_file=skill_file, timeout_seconds=timeout_seconds)
+            (artifacts_dir / "runner-script.sh").write_text(runner_script, encoding="utf-8")
             container_name = f"skill-sandbox-{uuid.uuid4().hex[:10]}"
 
             docker_cmd = [
@@ -204,6 +215,7 @@ class DockerRunner:
                     capture_output=True,
                     check=False,
                     timeout=timeout_seconds + 60,
+                    env=self._docker_env(),
                 )
             except subprocess.TimeoutExpired as exc:
                 monitor_stop.set()
@@ -303,14 +315,16 @@ class DockerRunner:
         with self._build_lock:
             if self._image_built:
                 return
+            force_rebuild = os.environ.get("PROVLOOM_REBUILD_SANDBOX_IMAGE", "").strip().lower() in {"1", "true", "yes"}
             # Reuse an existing local image to keep benchmark reruns stable.
             inspect_result = subprocess.run(
                 ["docker", "image", "inspect", self.image_name],
                 text=True,
                 capture_output=True,
                 check=False,
+                env=self._docker_env(),
             )
-            if inspect_result.returncode == 0:
+            if inspect_result.returncode == 0 and not force_rebuild:
                 self._image_built = True
                 return
             cmd = [
@@ -330,10 +344,47 @@ class DockerRunner:
                 str(self.dockerfile_dir / "Dockerfile"),
                 ".",
             ]
-            result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+            result = subprocess.run(cmd, text=True, capture_output=True, check=False, env=self._docker_env())
             if result.returncode != 0:
                 raise SandboxRunError(f"Failed to build sandbox image: {result.stderr.strip()}")
             self._image_built = True
+
+    def _docker_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["DOCKER_CONFIG"] = str(self.docker_config_dir)
+        env.pop("DOCKER_HOST", None)
+        return env
+
+    def _prepare_docker_config(self) -> None:
+        user_docker_dir = Path.home() / ".docker"
+        source_config = user_docker_dir / "config.json"
+        source_contexts = user_docker_dir / "contexts"
+        target_config = self.docker_config_dir / "config.json"
+        target_contexts = self.docker_config_dir / "contexts"
+
+        current_context = "desktop-linux"
+        if source_config.exists():
+            try:
+                config = json.loads(source_config.read_text(encoding="utf-8"))
+                current_context = str(config.get("currentContext") or current_context)
+            except Exception:
+                pass
+
+        if source_contexts.exists() and not target_contexts.exists():
+            shutil.copytree(source_contexts, target_contexts)
+
+        if not target_config.exists():
+            target_config.write_text(
+                json.dumps(
+                    {
+                        "auths": {},
+                        "currentContext": current_context,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
     def _build_runner_script(self, skill_file: str, timeout_seconds: int) -> str:
         skill_file_quoted = quote(skill_file)
@@ -342,7 +393,22 @@ set -eu
 cd /workspace/skill
 TIMED_OUT=0
 EXIT_CODE=0
-if timeout --preserve-status {timeout_seconds}s sh -lc 'PYTHONPATH=/opt/skill_sandbox /usr/bin/time -v -o /artifacts/runtime-resource-usage.txt strace -ff -tt -s 256 -o /artifacts/trace.log -e trace=file,process,network python -m app.runtime.container_runtime --skill-root /workspace/skill --skill-file {skill_file_quoted} --input-payload /artifacts/input-payload.json --runtime-events /artifacts/runtime-events.jsonl --llm-config /artifacts/llm-config.json > /artifacts/stdout.log 2> /artifacts/stderr.log'; then
+mkdir -p "$(dirname {skill_file_quoted})"
+find /workspace/skill -maxdepth 2 -type f -printf '%P\n' | sort > /artifacts/mount-file-list.txt || true
+python - <<'PY' > /artifacts/preflight-skill-entry.txt 2>&1 || true
+from pathlib import Path
+p = Path({skill_file_quoted!r})
+absolute = Path("/workspace/skill") / {skill_file_quoted!r}
+print("cwd_exists=", p.exists(), "cwd_is_file=", p.is_file(), "cwd_size=", p.stat().st_size if p.exists() else None)
+print("abs_exists=", absolute.exists(), "abs_is_file=", absolute.is_file(), "abs_size=", absolute.stat().st_size if absolute.exists() else None)
+print("entries=", sorted(item.name for item in Path("/workspace/skill").iterdir()))
+PY
+rm -rf /tmp/provloom-skill /tmp/provloom-artifacts
+mkdir -p /tmp/provloom-artifacts
+cp -a /workspace/skill /tmp/provloom-skill
+cp /artifacts/input-payload.json /tmp/provloom-artifacts/input-payload.json
+cp /artifacts/llm-config.json /tmp/provloom-artifacts/llm-config.json
+if timeout --preserve-status {timeout_seconds}s sh -lc 'PYTHONPATH=/opt/skill_sandbox /usr/bin/time -v -o /tmp/provloom-artifacts/runtime-resource-usage.txt strace -ff -tt -s 256 -o /tmp/provloom-artifacts/trace.log -e trace=file,process,network python -m app.runtime.container_runtime --skill-root /tmp/provloom-skill --skill-file {skill_file_quoted} --input-payload /tmp/provloom-artifacts/input-payload.json --runtime-events /tmp/provloom-artifacts/runtime-events.jsonl --llm-config /tmp/provloom-artifacts/llm-config.json > /tmp/provloom-artifacts/stdout.log 2> /tmp/provloom-artifacts/stderr.log'; then
   EXIT_CODE=0
 else
   EXIT_CODE=$?
@@ -350,6 +416,7 @@ else
     TIMED_OUT=1
   fi
 fi
+cp -a /tmp/provloom-artifacts/. /artifacts/ || true
 printf '{{"exit_code": %s, "timed_out": %s}}' "$EXIT_CODE" "$TIMED_OUT" > /artifacts/meta.json
 exit 0
 """.strip()
@@ -360,6 +427,7 @@ exit 0
             text=True,
             capture_output=True,
             check=False,
+            env=self._docker_env(),
         )
 
     def _sanitize_llm_config_artifact(self, path: Path) -> None:
@@ -417,6 +485,7 @@ exit 0
             text=True,
             capture_output=True,
             check=False,
+            env=self._docker_env(),
         )
         if result.returncode != 0 or not result.stdout.strip():
             return {}
@@ -439,6 +508,7 @@ exit 0
                     capture_output=True,
                     check=False,
                     timeout=2,
+                    env=self._docker_env(),
                 )
             except subprocess.TimeoutExpired:
                 # Keep the monitor non-blocking so benchmark execution can finish

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from agent_sandbox import deployment
 from agent_sandbox.adapters import AdapterCandidate
-from agent_sandbox.deployment import BuildOptions, BuildPlan, classify_build_failure, create_build_plan
+from agent_sandbox.deployment import BuildOptions, BuildPatch, BuildPlan, BuildResult, classify_build_failure, create_build_plan
 from agent_sandbox.image_reserve import MIRROR_IMAGES, OFFICIAL_IMAGES
 from agent_sandbox.static_scan import scan_project
 
@@ -41,6 +41,127 @@ def test_docker_build_runner_times_out_and_cleans_child_process(tmp_path: Path) 
     assert timed_out is True
     assert proc.returncode == -1
     assert elapsed < 10
+
+
+def test_build_patch_from_python_module_failure_installs_missing_package(tmp_path: Path) -> None:
+    plan = BuildPlan(
+        plan_id="p",
+        language="Python",
+        framework=None,
+        protocol="cli",
+        base_image="aegisagent-python:3.12-bookworm",
+        workdir="/workspace",
+        install_commands=["python -m pip install -r requirements.txt"],
+        start_command="python main.py",
+    )
+    result = BuildResult(
+        status="failed",
+        failure_class="build_script_failed",
+        human_reason="ModuleNotFoundError: No module named 'yaml'",
+    )
+
+    patch = deployment.build_patch_from_failure(tmp_path, plan, result, [])
+
+    assert patch is not None
+    assert patch.add_python_packages == ["PyYAML"]
+
+
+def test_apply_build_patches_accumulates_missing_components(tmp_path: Path) -> None:
+    plan = BuildPlan(
+        plan_id="p",
+        language="Python",
+        framework=None,
+        protocol="cli",
+        base_image="aegisagent-python:3.12-bookworm",
+        workdir="/workspace",
+        install_commands=["python -m pip install -r requirements.txt"],
+        start_command="python main.py",
+    )
+
+    patched = deployment.apply_build_patches(
+        tmp_path,
+        plan,
+        [
+            BuildPatch(add_python_packages=["PyYAML"], reason="missing yaml"),
+            BuildPatch(add_system_packages=["libsqlite3-dev"], reason="missing sqlite3.h"),
+        ],
+    )
+
+    install_text = "\n".join(patched.install_commands)
+    assert "libsqlite3-dev" in install_text
+    assert "PyYAML" in install_text
+    assert len(patched.build_patches) == 2
+    assert patched.cache_key != plan.cache_key
+
+
+def test_base_image_auth_failure_retries_next_public_fallback(tmp_path: Path) -> None:
+    plan = BuildPlan(
+        plan_id="p",
+        language="Node.js",
+        framework=None,
+        protocol="cli",
+        base_image="m.daocloud.io/docker.io/library/node:22-bookworm",
+        workdir="/workspace",
+        install_commands=["npm ci"],
+        start_command="node index.js",
+        image_resolution={
+            "public_fallback_candidates": [
+                "m.daocloud.io/docker.io/library/node:22-bookworm",
+                OFFICIAL_IMAGES["node"],
+                "docker.1ms.run/library/node:22-bookworm",
+            ],
+        },
+    )
+    result = BuildResult(
+        status="failed",
+        failure_class="auth_required",
+        logs=[
+            {
+                "step": "docker_build",
+                "stderr": "failed to resolve source metadata for m.daocloud.io/docker.io/library/node:22-bookworm: 401 Unauthorized",
+            }
+        ],
+    )
+
+    patch = deployment.build_patch_from_failure(tmp_path, plan, result, [])
+
+    assert patch is not None
+    assert patch.switch_base_image == OFFICIAL_IMAGES["node"]
+
+
+def test_progressive_build_retries_with_feedback_patch(monkeypatch, tmp_path: Path) -> None:
+    plan = BuildPlan(
+        plan_id="p",
+        language="Python",
+        framework=None,
+        protocol="cli",
+        base_image="aegisagent-python:3.12-bookworm",
+        workdir="/workspace",
+        install_commands=["python -m pip install -r requirements.txt"],
+        start_command="python main.py",
+    )
+    calls: list[BuildPlan] = []
+
+    def fake_build_once(root: Path, current: BuildPlan, options: BuildOptions) -> BuildResult:
+        calls.append(current)
+        if len(calls) == 1:
+            return BuildResult(
+                status="failed",
+                failure_class="build_script_failed",
+                human_reason="ModuleNotFoundError: No module named 'yaml'",
+            )
+        return BuildResult(status="built", image=current.cache_image)
+
+    monkeypatch.setattr(deployment, "_build_environment_once", fake_build_once)
+
+    result = deployment.build_environment(tmp_path, plan, BuildOptions(max_build_attempts=3))
+
+    assert result.status == "built"
+    assert len(calls) == 2
+    assert "PyYAML" in "\n".join(calls[1].install_commands)
+    assert result.applied_patches[0]["add_python_packages"] == ["PyYAML"]
+    assert result.attempts[0]["status"] == "failed"
+    assert result.attempts[1]["status"] == "built"
 
 
 def test_rewrite_maven_doc_package_command_uses_cache_and_skips_tests() -> None:
@@ -119,6 +240,14 @@ def test_node_lockfile_prefers_npm_ci_and_build(tmp_path: Path) -> None:
     assert plan.base_image in {"aegisagent-node:22-bookworm", MIRROR_IMAGES["node"], OFFICIAL_IMAGES["node"]}
     assert plan.install_commands == ["npm ci --prefer-offline"]
     assert plan.build_commands == ["npm run build"]
+
+
+def test_public_fallback_images_prefer_official_before_mirrors() -> None:
+    from agent_sandbox import image_reserve
+
+    assert image_reserve.PUBLIC_FALLBACK_IMAGES["node"][0] == image_reserve.OFFICIAL_IMAGES["node"]
+    assert image_reserve.PUBLIC_FALLBACK_IMAGES["python"][0] == image_reserve.OFFICIAL_IMAGES["python"]
+    assert not image_reserve.PUBLIC_FALLBACK_IMAGES["node"][0].startswith("m.daocloud.io/")
 
 
 def test_bun_project_uses_bun_image_and_commands(tmp_path: Path) -> None:

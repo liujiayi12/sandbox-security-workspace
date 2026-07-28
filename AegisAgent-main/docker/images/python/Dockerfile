@@ -13,15 +13,26 @@ RUN set -eux; \
     ca-certificates \
     cmake \
     curl \
+    ffmpeg \
     git \
+    libasound2 \
     libffi-dev \
+    libgbm1 \
+    libgl1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
     libjpeg-dev \
+    libnss3 \
     libpq-dev \
+    libsqlite3-dev \
     libssl-dev \
     libxml2-dev \
     libxslt1-dev \
     pkg-config \
+    portaudio19-dev \
     protobuf-compiler \
+    python3-dev \
+    libsndfile1-dev \
     sqlite3 \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*

@@ -9,7 +9,18 @@ RUN set -eux; \
     build-essential \
     ca-certificates \
     cmake \
+    curl \
+    ffmpeg \
     git \
+    libasound2 \
+    libffi-dev \
+    libgbm1 \
+    libgl1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnss3 \
+    libsqlite3-dev \
+    libssl-dev \
     make \
     pkg-config \
     python3 \

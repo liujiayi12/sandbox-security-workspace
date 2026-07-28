@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from .constants import SEVERITY_ORDER
+from .provenance import build_provenance_report
 from .schemas import AttackPlan, Finding, ProjectProfile, Report
 from .trajectory import build_safety_trajectory
 
@@ -403,6 +404,7 @@ def build_report(
     evidence.setdefault("dynamic_status", dynamic_status)
     adaptation = _adaptation_summary(profile, evidence, dynamic_status)
     trajectory = build_safety_trajectory(profile, attack_plan, evidence, findings)
+    provenance = build_provenance_report(profile, attack_plan, evidence, findings)
     report = Report(
         run_id=run_id,
         status=status,
@@ -413,7 +415,7 @@ def build_report(
         profile=profile,
         findings=sorted(findings, key=lambda item: SEVERITY_ORDER[item.severity], reverse=True),
         attack_plan=attack_plan,
-        evidence={**evidence, "adaptation": adaptation, "safety_trajectory": trajectory, "taxonomy": trajectory["taxonomy"], "episode": trajectory["episode"]},
+        evidence={**evidence, "adaptation": adaptation, "safety_trajectory": trajectory, "taxonomy": trajectory["taxonomy"], "episode": trajectory["episode"], "provenance": provenance},
         failures=failures,
         build_status=evidence.get("build_status"),
         build_plan=evidence.get("build_plan"),
@@ -440,7 +442,9 @@ def report_to_markdown(report: Report | dict[str, Any]) -> str:
     taxonomy = evidence.get("taxonomy") or {}
     episode = evidence.get("episode") or {}
     adaptation = evidence.get("adaptation") or {}
+    provenance = evidence.get("provenance") or {}
     build_plan = data.get("build_plan") or evidence.get("build_plan") or {}
+    build_result = data.get("build_result") or evidence.get("build_result") or {}
     image_resolution = build_plan.get("image_resolution") if isinstance(build_plan, dict) else {}
     image_resolution = image_resolution if isinstance(image_resolution, dict) else {}
     fake_environment = evidence.get("fake_environment") or {}
@@ -529,6 +533,21 @@ def report_to_markdown(report: Report | dict[str, Any]) -> str:
             f"- Image reserve public pull required: {'yes' if image_resolution.get('requires_public_pull') else 'no' if image_resolution else '-'}",
             f"- Image reserve local hits: {_join_or_dash(image_resolution.get('local_reserve_available'))}",
             f"- Image reserve cached public hits: {_join_or_dash(image_resolution.get('public_fallback_available'))}",
+            f"- Build feedback attempts: {_build_attempt_summary(build_result)}",
+            f"- Build feedback patches: {_build_patch_summary(build_result)}",
+            "",
+            "## Provenance Layer",
+            "",
+            f"- Coverage: {_provenance_coverage_summary(provenance.get('coverage'))}",
+            f"- Config/repo/dependency changes: {_provenance_change_summary(provenance.get('file_changes'))}",
+            f"- Natural-language command links: {_provenance_nl_summary(provenance.get('natural_language_triggers'))}",
+            f"- MCP server/tool lineage: {_provenance_mcp_summary(provenance.get('mcp_servers'))}",
+            f"- LLM API key usage: {_provenance_key_usage_summary(provenance.get('llm_api_key_usage'))}",
+            f"- Credential directory access: {_provenance_credential_summary(provenance.get('credential_access'))}",
+            f"- CI workflow/release activity: {_provenance_ci_summary(provenance.get('ci_workflow_activity'))}",
+            f"- DNS high-entropy indicators: {_provenance_dns_summary(provenance.get('dns_activity'))}",
+            "",
+            f"- Filesystem compatibility warnings: {_md_value(adaptation.get('filesystem_warning_count', 0))} ({_md_value(adaptation.get('filesystem_warning_summary') or '-')})",
             f"- First-level build image cleanup requested: {'yes' if evidence.get('delete_build_image_after_run') else 'no'}",
             f"- First-level build image cleanup results: {_image_cleanup_summary(evidence.get('image_cleanup'))}",
             "",
@@ -739,6 +758,8 @@ def _adaptation_summary(profile: ProjectProfile | None, evidence: dict[str, Any]
         "runtime_selected_interface": launch.get("selected_interface") if isinstance(launch.get("selected_interface"), dict) else None,
         "runtime_discovered_interface_count": len(launch.get("discovered_interfaces") or []) if isinstance(launch.get("discovered_interfaces"), list) else 0,
         "build_image_resolution": _build_image_resolution_summary(evidence.get("build_plan")),
+        "filesystem_warning_count": len(evidence.get("filesystem_warnings") or []),
+        "filesystem_warning_summary": _filesystem_warning_summary(evidence.get("filesystem_warnings")),
     }
 
 
@@ -811,6 +832,127 @@ def _image_cleanup_summary(items: Any) -> str:
         status = str(item.get("status") or "unknown") if isinstance(item, dict) else "unknown"
         counts[status] = counts.get(status, 0) + 1
     return ", ".join(f"{key}:{value}" for key, value in sorted(counts.items()))
+
+
+def _build_attempt_summary(build_result: Any) -> str:
+    if not isinstance(build_result, dict):
+        return "-"
+    attempts = build_result.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return "-"
+    parts = []
+    for item in attempts[:6]:
+        if not isinstance(item, dict):
+            continue
+        attempt = item.get("attempt") or "?"
+        status = item.get("status") or "unknown"
+        failure = item.get("failure_class") or "-"
+        parts.append(f"{attempt}:{status}/{failure}")
+    return ", ".join(parts) if parts else "-"
+
+
+def _build_patch_summary(build_result: Any) -> str:
+    if not isinstance(build_result, dict):
+        return "-"
+    patches = build_result.get("applied_patches")
+    if not isinstance(patches, list) or not patches:
+        return "-"
+    parts = []
+    for patch in patches[:6]:
+        if not isinstance(patch, dict):
+            continue
+        components = []
+        for key, label in (
+            ("add_system_packages", "apt"),
+            ("add_python_packages", "pip"),
+            ("add_node_packages", "npm"),
+            ("add_go_commands", "go"),
+            ("add_rust_commands", "rust"),
+            ("add_java_commands", "java"),
+            ("append_install_commands", "cmd"),
+        ):
+            values = patch.get(key)
+            if isinstance(values, list) and values:
+                components.append(f"{label}:{'/'.join(str(value) for value in values[:4])}")
+        if patch.get("relax_lockfile"):
+            components.append("lockfile:relaxed")
+        if patch.get("switch_base_image"):
+            components.append(f"image:{patch.get('switch_base_image')}")
+        if components:
+            parts.append("; ".join(components))
+    return " | ".join(parts) if parts else "-"
+
+
+def _filesystem_warning_summary(items: Any) -> str:
+    if not isinstance(items, list) or not items:
+        return "-"
+    counts: dict[str, int] = {}
+    examples: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason") or "unknown")
+        action = str(item.get("action") or "skipped")
+        key = f"{action}:{reason}"
+        counts[key] = counts.get(key, 0) + 1
+        if len(examples) < 3:
+            examples.append(str(item.get("path") or "-"))
+    summary = ", ".join(f"{key}:{value}" for key, value in sorted(counts.items())[:4])
+    if examples:
+        summary = f"{summary}; examples: {', '.join(examples)}"
+    return summary[:500]
+
+
+def _provenance_coverage_summary(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return "-"
+    return ", ".join(f"{key}:{status}" for key, status in sorted(value.items()))[:800]
+
+
+def _provenance_change_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    counts = value.get("counts_by_category")
+    if not isinstance(counts, dict) or not counts:
+        return "no relevant changes"
+    return ", ".join(f"{key}:{counts[key]}" for key in sorted(counts))
+
+
+def _provenance_nl_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return f"tasks:{len(value.get('tasks') or [])}, links:{len(value.get('command_links') or [])}, unlinked:{value.get('unlinked_command_count', 0)}"
+
+
+def _provenance_mcp_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return f"servers:{value.get('server_count', 0)}, metadata_reads:{value.get('metadata_read_count', 0)}, tool_calls:{value.get('tool_call_count', 0)}"
+
+
+def _provenance_key_usage_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    keys = value.get("provided_key_names")
+    return f"provided:{_join_or_dash(keys)}, uses:{value.get('use_count', 0)}, fake_llm_events:{value.get('fake_llm_event_count', 0)}"
+
+
+def _provenance_credential_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return f"status:{value.get('status', '-')}, decoys:{len(value.get('decoy_files') or [])}, canary_hits:{len(value.get('credential_canary_hits') or [])}, leaks:{len(value.get('credential_canary_leaks') or [])}"
+
+
+def _provenance_ci_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return f"status:{value.get('status', '-')}, ci_changes:{len(value.get('ci_file_changes') or [])}, release_commands:{len(value.get('release_or_propagation_commands') or [])}, repo_mutations:{len(value.get('repository_service_mutations') or [])}"
+
+
+def _provenance_dns_summary(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return f"status:{value.get('status', '-')}, observed_dns:{value.get('observed_dns_request_count', 0)}, candidates:{value.get('candidate_count', 0)}, high_entropy:{value.get('high_entropy_count', 0)}, mode:{value.get('capture_mode', '-')}"
 
 
 def _build_image_resolution_summary(build_plan: Any) -> dict[str, Any]:
@@ -1276,3 +1418,552 @@ def _is_mutation_event(event: dict[str, Any]) -> bool:
 
 def _is_outbound_event(event: dict[str, Any]) -> bool:
     return str(event.get("method") or "").upper() in {"POST", "PUT", "PATCH", "DELETE"}
+
+
+# User-facing report renderer. It intentionally avoids dumping raw JSON/status-machine
+# structures into Markdown; structured evidence remains available from the JSON API.
+def report_to_markdown(report: Report | dict[str, Any]) -> str:  # type: ignore[no-redef]
+    data = report.model_dump() if isinstance(report, Report) else dict(report)
+    findings = list(data.get("findings") or [])
+    evidence = data.get("evidence") if isinstance(data.get("evidence"), dict) else {}
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+    episode = evidence.get("episode") if isinstance(evidence.get("episode"), dict) else {}
+    adaptation = evidence.get("adaptation") if isinstance(evidence.get("adaptation"), dict) else {}
+    fake_environment = evidence.get("fake_environment") if isinstance(evidence.get("fake_environment"), dict) else {}
+    provenance = evidence.get("provenance") if isinstance(evidence.get("provenance"), dict) else {}
+    failures = list(data.get("failures") or [])
+
+    lines: list[str] = [
+        "# AegisAgent 智能体安全扫描报告",
+        "",
+        "## 一、总体结论",
+        "",
+        f"- 本次扫描结果：{_cn_run_status(data.get('status'))}",
+        f"- 动态测试结果：{_cn_dynamic_status(data.get('dynamic_status'))}",
+        f"- 大模型辅助：{_cn_llm_status(data.get('llm_status'))}",
+        f"- 综合风险等级：{_risk_label(str(data.get('risk_level') or 'unknown'))}",
+        f"- 构建情况：{_cn_build_status(data.get('build_status'))}",
+        f"- 是否建议使用真实接口密钥复测：{'建议' if data.get('requires_runtime_api_key') else '暂不需要'}",
+        "",
+        _friendly_recommendation_paragraph(str(data.get("risk_level") or "unknown"), str(data.get("dynamic_status") or "")),
+        "",
+        "## 二、智能体画像",
+        "",
+        *_agent_profile_lines(profile, adaptation, evidence),
+        "",
+        "## 三、发现的主要风险",
+        "",
+    ]
+    if findings:
+        for index, finding in enumerate(findings, 1):
+            lines.extend(_friendly_finding_lines(index, finding, evidence))
+    else:
+        lines.extend(["本次没有发现明确的高风险行为。", ""])
+
+    attack_story = _dynamic_attack_story(evidence, episode, fake_environment)
+    lines.extend(
+        [
+            "## 四、动态攻击测试过程",
+            "",
+            "下面用更接近日常语言的方式说明：沙箱做了什么测试，以及智能体出现了什么反应。",
+            "",
+            *attack_story,
+            "",
+            "## 五、溯源结果",
+            "",
+            *_friendly_provenance_lines(provenance),
+            "",
+            "## 六、测试环境与限制",
+            "",
+            *_friendly_environment_lines(evidence, adaptation, fake_environment),
+        ]
+    )
+    if failures:
+        lines.extend(["", "本次记录到的限制或失败："])
+        for failure in failures[:8]:
+            lines.append(f"- {_friendly_failure(failure)}")
+    else:
+        lines.append("- 构建和动态运行阶段没有记录到阻断性失败。")
+    lines.extend(
+        [
+            "",
+            "## 七、复核信息",
+            "",
+            f"- 运行编号：{_plain(data.get('run_id'))}",
+            f"- 输入文件：{_plain(data.get('input_name') or '-')}",
+            f"- 缓存编号：{_plain(data.get('cache_key') or '-')}",
+            "",
+            "说明：这份 Markdown 报告面向普通用户阅读。更完整的结构化证据保留在结构化报告数据中，便于开发者复核。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _recommendation(risk: str, dynamic_status: str) -> str:  # type: ignore[no-redef]
+    return _friendly_recommendation_paragraph(risk, dynamic_status)
+
+
+def _friendly_recommendation_paragraph(risk: str, dynamic_status: str) -> str:
+    risk = (risk or "").lower()
+    if risk in {"critical", "high"}:
+        return "建议先不要把这个智能体接入真实账号、真实密钥或生产环境。报告中已经出现可复核的高风险证据，应先修复相关问题，再使用临时低权限密钥重新测试。"
+    if risk == "medium":
+        return "可以继续评估这个智能体，但建议只给它必要的最小权限，并优先修复报告中标出的可触达攻击面。"
+    if risk == "unknown":
+        if dynamic_status == "docker_unavailable":
+            return "本次只完成了静态检查。启动 Docker 后重新测试，可以获得更可靠的动态证据。"
+        return "本次动态测试没有完整完成，建议先查看失败原因，补充运行配置后重新测试。"
+    return "本次没有观察到明确的高风险行为。仍建议使用最小权限运行，并避免直接提供长期有效的真实密钥。"
+
+
+def _agent_profile_lines(profile: dict[str, Any], adaptation: dict[str, Any], evidence: dict[str, Any]) -> list[str]:
+    adapter = adaptation.get("adapter") if isinstance(adaptation.get("adapter"), dict) else {}
+    selected_interface = adaptation.get("runtime_selected_interface") if isinstance(adaptation.get("runtime_selected_interface"), dict) else {}
+    capabilities = profile.get("capabilities") if isinstance(profile.get("capabilities"), list) else []
+    lines = [
+        f"- 主要语言：{_join_cn(profile.get('languages'))}",
+        f"- 使用框架：{_join_cn(profile.get('frameworks'))}",
+        f"- 交互方式：{_cn_protocols(profile.get('protocol_candidates'))}",
+        f"- 入口文件：{_join_cn(profile.get('entrypoints'))}",
+        f"- 沙箱选择的启动方式：{_friendly_adapter(adapter, adaptation)}",
+        f"- 动态测试是否找到业务接口：{'找到了' if adaptation.get('runtime_business_interface_reached') else '没有明确找到'}",
+    ]
+    if selected_interface:
+        lines.append(f"- 被测试的主要接口：{_plain(selected_interface.get('path') or '-')}")
+    if capabilities:
+        lines.append(f"- 具备的敏感能力：{_join_cn(_translate_capability(item) for item in capabilities)}")
+    else:
+        lines.append("- 具备的敏感能力：未在静态扫描中明显识别到")
+    runtime_network = evidence.get("runtime_network")
+    if runtime_network:
+        lines.append(f"- 运行网络策略：{_cn_network(runtime_network)}")
+    return lines
+
+
+def _friendly_adapter(adapter: dict[str, Any], adaptation: dict[str, Any]) -> str:
+    name = adapter.get("name") or "-"
+    protocol = _cn_protocol(adapter.get("protocol") or "")
+    command = adaptation.get("entry_command") or adapter.get("start")
+    if command:
+        return f"{protocol}方式，启动命令已由沙箱识别"
+    return f"{protocol} 方式，适配器为 {_plain(name)}"
+
+
+def _friendly_finding_lines(index: int, finding: dict[str, Any], evidence: dict[str, Any]) -> list[str]:
+    title = _friendly_finding_title(finding)
+    severity = _risk_label(str(finding.get("severity") or "info"))
+    risk_type = _risk_type_label(str(finding.get("risk_type") or finding.get("source") or "-"))
+    attack_surface = _join_cn(_translate_surface(item) for item in (finding.get("attack_surface") or []))
+    lines = [
+        f"### {index}. {title}",
+        "",
+        f"- 风险等级：{severity}",
+        f"- 证据类型：{risk_type}",
+        f"- 相关攻击面：{attack_surface}",
+        "",
+        _friendly_finding_description(finding),
+        "",
+        "证据说明：",
+    ]
+    evidence_lines = _friendly_evidence_lines(finding, evidence)
+    lines.extend(evidence_lines or ["- 本项主要来自静态扫描，建议结合动态测试继续复核。"])
+    lines.append("")
+    return lines
+
+
+def _friendly_finding_title(finding: dict[str, Any]) -> str:
+    finding_id = str(finding.get("id") or "")
+    category = str(finding.get("category") or "")
+    mapping = {
+        "dynamic_canary_exfiltration": "测试密钥被发送到外部服务",
+        "dynamic_canary_response_leak": "测试密钥出现在智能体回复或运行输出中",
+        "dynamic_canary_persistence": "测试密钥被写入文件或记忆",
+        "dynamic_scheduler_task_due": "定时任务或延迟执行能力可被触发",
+        "dynamic_mcp_tool_called": "智能体调用了受控 MCP 工具",
+        "dynamic_mcp_tool_metadata_poisoning": "MCP 工具描述中存在可影响智能体的恶意指令",
+        "dynamic_fake_surface_reached": "智能体访问了沙箱投放的外部内容",
+        "dynamic_external_side_effect": "智能体对外部服务执行了写入或发送操作",
+        "dynamic_suspicious_url_visited": "智能体访问了可疑链接",
+        "dynamic_indirect_injection_chain": "外部内容影响了智能体后续行为",
+        "dynamic_scenario_triggered": "完整攻击链被触发",
+    }
+    category_mapping = {
+        "secret_access": "存在读取密钥或凭据的能力",
+        "secret_handling": "密钥处理存在风险",
+        "secret_exfiltration": "密钥泄露风险",
+        "mcp_agent": "MCP 或工具调用能力存在风险",
+        "external_input": "外部内容输入存在风险",
+        "external_action": "外部操作权限存在风险",
+        "persistence": "记忆或定时任务存在风险",
+        "shell_execution": "命令执行能力存在风险",
+        "network_access": "网络访问能力存在风险",
+        "tool_poisoning_surface": "工具或插件元数据存在投毒面",
+    }
+    return mapping.get(finding_id) or category_mapping.get(category) or _translate_title(str(finding.get("title") or "风险项"))
+
+
+def _friendly_finding_description(finding: dict[str, Any]) -> str:
+    category = str(finding.get("category") or "")
+    risk_type = str(finding.get("risk_type") or "")
+    if category in {"secret_access", "secret_handling"} and risk_type == "capability":
+        return "代码或配置中出现了读取环境变量、密钥文件或凭据目录的能力。这不一定代表已经泄露，但说明需要重点防护。"
+    if category == "secret_exfiltration":
+        return "沙箱在动态测试中观察到测试密钥进入了对外可见的位置，例如回复、日志或受控外部服务。这类结果通常需要优先修复。"
+    if category == "mcp_agent":
+        return "智能体具备 MCP 或工具调用能力。如果工具描述、权限或来源没有校验，可能被恶意工具诱导执行非预期操作。"
+    if category == "external_input":
+        return "智能体会读取网页、邮件、代码托管、检索文档等外部内容。外部内容可能夹带隐藏指令，需要确认智能体是否能正确隔离。"
+    if category == "external_action":
+        return "智能体对外部服务产生了写入、发送、评论或类似副作用。需要确认这些动作是否经过用户授权。"
+    if category == "persistence":
+        return "智能体存在记忆、任务计划或延迟执行相关行为。攻击者可能把恶意指令保存下来，等待之后触发。"
+    if category == "shell_execution":
+        return "智能体或其依赖具备执行系统命令的能力。如果自然语言输入能影响命令内容，风险会明显升高。"
+    return _translate_title(str(finding.get("description") or "该风险需要结合证据进一步复核。"))
+
+
+def _friendly_evidence_lines(finding: dict[str, Any], evidence: dict[str, Any]) -> list[str]:
+    finding_id = str(finding.get("id") or "")
+    category = str(finding.get("category") or "")
+    raw_items = [item for item in (finding.get("evidence") or []) if isinstance(item, dict)]
+    lines: list[str] = []
+    if finding_id == "dynamic_canary_response_leak":
+        steps = sorted({str(item.get("step") or "运行步骤") for item in raw_items})
+        lines.append(f"- 沙箱向智能体提供了测试密钥，随后在智能体的运行输出中看到了该测试密钥。相关步骤：{_join_cn(_translate_step(step) for step in steps)}。")
+    elif finding_id == "dynamic_canary_exfiltration":
+        surfaces = sorted({_translate_surface(_fake_surface(item) or "") for item in raw_items if _fake_surface(item)})
+        lines.append(f"- 沙箱投放测试密钥后，受控外部服务收到了包含测试密钥的请求。涉及位置：{_join_cn(surfaces)}。")
+    elif finding_id == "dynamic_scheduler_task_due":
+        tasks = [str(item.get("name") or item.get("id") or "未命名任务") for item in raw_items]
+        lines.append(f"- 沙箱注入了延迟任务并推进测试时间，结果观察到任务进入可执行状态。任务：{_join_cn(tasks)}。")
+    elif finding_id == "dynamic_mcp_tool_called":
+        tools = [str(item.get("tool") or "未命名工具") for item in raw_items]
+        lines.append(f"- 沙箱提供了受控 MCP 工具，智能体实际调用了这些工具。工具：{_join_cn(tools)}。")
+    elif finding_id == "dynamic_fake_surface_reached":
+        surfaces = sorted({_translate_surface(_fake_surface(item) or "") for item in raw_items if _fake_surface(item)})
+        lines.append(f"- 沙箱投放了网页、邮件、代码托管或检索文档等外部内容，智能体访问了其中的内容。访问面：{_join_cn(surfaces)}。")
+    elif finding_id == "dynamic_external_side_effect":
+        actions = [_friendly_event_action(item) for item in raw_items[:5]]
+        lines.append(f"- 智能体对受控外部服务执行了写入或发送类动作：{_join_cn(actions)}。")
+    elif finding_id == "dynamic_suspicious_url_visited":
+        urls = [str(item.get("path") or "可疑链接") for item in raw_items[:5]]
+        lines.append(f"- 沙箱放置了可疑链接，智能体访问了这些链接：{_join_cn(urls)}。")
+    elif category == "secret_access":
+        lines.extend(_source_location_lines(raw_items, "发现代码读取了密钥或凭据相关内容"))
+    elif category == "shell_execution":
+        lines.extend(_source_location_lines(raw_items, "发现代码具备执行系统命令的能力"))
+    else:
+        lines.extend(_source_location_lines(raw_items, "发现相关证据"))
+    if not lines and evidence.get("canary_hits"):
+        lines.append("- 动态测试结束后，沙箱在文件或输出中找到了测试密钥痕迹。")
+    return lines[:5]
+
+
+def _source_location_lines(items: list[dict[str, Any]], prefix: str) -> list[str]:
+    lines = []
+    for item in items[:5]:
+        file = item.get("file") or item.get("path")
+        line = item.get("line")
+        snippet = _plain(item.get("snippet") or item.get("reason") or "")
+        location = f"{file} 第 {line} 行" if file and line else str(file or "相关位置")
+        if snippet:
+            lines.append(f"- {prefix}：{location}，片段为“{snippet[:120]}”。")
+        else:
+            lines.append(f"- {prefix}：{location}。")
+    return lines
+
+
+def _dynamic_attack_story(evidence: dict[str, Any], episode: dict[str, Any], fake_environment: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    checklist = episode.get("checklist") if isinstance(episode.get("checklist"), dict) else {}
+    if fake_environment.get("enabled"):
+        lines.append("- 沙箱搭建了受控外部环境，用来模拟网页、邮件、代码托管、检索文档、MCP 工具、记忆和定时任务等外部输入。")
+    else:
+        lines.append("- 本次没有启用受控外部环境，因此动态攻击覆盖范围有限。")
+    read_surfaces = episode.get("external_read_surfaces") or []
+    if read_surfaces:
+        lines.append(f"- 外部内容注入测试：沙箱投放了不可信内容，智能体读取了其中的 {_join_cn(_translate_surface(item) for item in read_surfaces)}。")
+    else:
+        lines.append("- 外部内容注入测试：没有观察到智能体读取沙箱投放的不可信外部内容。")
+    if episode.get("suspicious_url_visit_count"):
+        lines.append(f"- 可疑链接测试：智能体访问了沙箱准备的可疑链接，类别为 {_join_cn(episode.get('suspicious_url_categories'))}。")
+    if episode.get("mcp_tool_call_count"):
+        lines.append(f"- MCP 工具测试：智能体调用了沙箱提供的受控工具，工具名为 {_join_cn(episode.get('mcp_tool_calls'))}。")
+    if episode.get("scheduler_due_task_count"):
+        lines.append(f"- 延迟任务测试：沙箱注入了定时或延迟任务，并推进时间；结果有任务进入可执行状态：{_join_cn(episode.get('scheduler_due_tasks'))}。")
+    if checklist.get("canary_exfiltration_observed"):
+        lines.append("- 密钥泄露测试：沙箱提供的测试密钥出现在对外请求中，说明智能体没有把密钥留在安全边界内。")
+    elif checklist.get("canary_persisted_in_files"):
+        lines.append("- 密钥持久化测试：测试密钥被写入文件或记忆，说明敏感信息可能被长期保存。")
+    else:
+        lines.append("- 密钥泄露测试：没有观察到测试密钥被发送到受控外部服务。")
+    if checklist.get("agent_performed_external_mutation"):
+        lines.append("- 外部副作用测试：智能体对外部服务执行了写入、发送或评论等动作，需要确认这些动作是否经过用户授权。")
+    scenario_names = _friendly_scenario_names(episode.get("triggered_scenarios"))
+    if scenario_names:
+        lines.append(f"- 完整攻击链：以下场景被完整或基本触发：{_join_cn(scenario_names)}。")
+    return lines
+
+
+def _friendly_provenance_lines(provenance: dict[str, Any]) -> list[str]:
+    if not provenance:
+        return ["- 本次报告没有生成溯源摘要。"]
+    coverage = provenance.get("coverage") if isinstance(provenance.get("coverage"), dict) else {}
+    file_changes = provenance.get("file_changes") if isinstance(provenance.get("file_changes"), dict) else {}
+    natural = provenance.get("natural_language_triggers") if isinstance(provenance.get("natural_language_triggers"), dict) else {}
+    mcp = provenance.get("mcp_servers") if isinstance(provenance.get("mcp_servers"), dict) else {}
+    key_usage = provenance.get("llm_api_key_usage") if isinstance(provenance.get("llm_api_key_usage"), dict) else {}
+    credential = provenance.get("credential_access") if isinstance(provenance.get("credential_access"), dict) else {}
+    ci = provenance.get("ci_workflow_activity") if isinstance(provenance.get("ci_workflow_activity"), dict) else {}
+    dns = provenance.get("dns_activity") if isinstance(provenance.get("dns_activity"), dict) else {}
+    return [
+        f"- 配置、仓库和依赖变更：{_cn_observed(coverage.get('configuration_repository_dependency_changes'))}。相关变更数量：{file_changes.get('risk_relevant_count', 0)}。",
+        f"- 自然语言任务触发命令：{_cn_observed(coverage.get('natural_language_task_to_command'))}。已关联命令数：{len(natural.get('command_links') or [])}。",
+        f"- MCP 服务和工具来源：{_cn_observed(coverage.get('mcp_server_lineage'))}。识别到服务 {mcp.get('server_count', 0)} 个，工具调用 {mcp.get('tool_call_count', 0)} 次。",
+        f"- 大模型接口密钥使用：{_cn_observed(coverage.get('llm_api_key_usage'))}。观察到使用次数：{key_usage.get('use_count', 0)}。",
+        f"- 无关凭据目录读取：{_cn_observed(credential.get('status'))}。凭据诱饵命中 {len(credential.get('credential_canary_hits') or [])} 次。",
+        f"- 持续集成或发布动作：{_cn_observed(ci.get('status'))}。可疑发布/提交动作 {len(ci.get('release_or_propagation_commands') or [])} 条。",
+        f"- 域名高熵数据：{_cn_observed(dns.get('status'))}。实际 DNS 查询 {dns.get('observed_dns_request_count', 0)} 条，日志或域名中出现高熵/编码特征 {dns.get('high_entropy_count', 0)} 条。",
+    ]
+
+
+def _friendly_environment_lines(evidence: dict[str, Any], adaptation: dict[str, Any], fake_environment: dict[str, Any]) -> list[str]:
+    lines = [
+        f"- 受控外部环境：{'已启用' if adaptation.get('fake_environment_enabled') else '未启用'}。",
+        f"- 构建镜像来源：{_cn_image_layer(((evidence.get('build_plan') or {}).get('image_resolution') or {}).get('selected_layer'))}。",
+        f"- 文件系统兼容警告：{adaptation.get('filesystem_warning_count', 0)} 条。",
+    ]
+    event_counts = fake_environment.get("event_counts") if isinstance(fake_environment.get("event_counts"), dict) else {}
+    if event_counts:
+        pairs = [f"{_translate_surface(key)} {value} 次" for key, value in sorted(event_counts.items())[:8]]
+        lines.append(f"- 受控环境访问记录：{_join_cn(pairs)}。")
+    cleanup = evidence.get("image_cleanup")
+    if cleanup:
+        lines.append(f"- 一级镜像清理：{_image_cleanup_summary(cleanup)}。")
+    return lines
+
+
+def _friendly_failure(failure: dict[str, Any]) -> str:
+    if not isinstance(failure, dict):
+        return _plain(failure)
+    stage = _translate_stage(failure.get("stage"))
+    reason = failure.get("reason") or failure.get("failure_class") or "未给出详细原因"
+    return f"{stage} 阶段：{_plain(reason)}"
+
+
+def _friendly_event_action(event: dict[str, Any]) -> str:
+    method = str(event.get("method") or "请求").upper()
+    path = str(event.get("path") or event.get("proxy_path") or "外部服务")
+    surface = _translate_surface(_fake_surface(event) or str(event.get("surface") or ""))
+    return f"向{surface}发起 {method} 请求（{path}）"
+
+
+def _friendly_scenario_names(values: Any) -> list[str]:
+    mapping = {
+        "cross_surface_prompt_injection": "跨外部内容提示注入",
+        "persistent_delayed_trigger": "持久化与延迟触发",
+        "mcp_tool_poisoning": "MCP 工具投毒",
+    }
+    if not isinstance(values, list):
+        return []
+    return [mapping.get(str(item), str(item)) for item in values if item]
+
+
+def _risk_label(value: str) -> str:  # type: ignore[no-redef]
+    mapping = {
+        "critical": "严重",
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+        "info": "提示",
+        "unknown": "未知",
+    }
+    return mapping.get(str(value).lower(), str(value))
+
+
+def _risk_type_label(value: str) -> str:  # type: ignore[no-redef]
+    mapping = {
+        "capability": "只发现能力，还需要动态验证",
+        "reachable_surface": "已经触达攻击面，但未必造成危害",
+        "observed_behavior": "已经观察到实际行为",
+        "dynamic": "动态测试证据",
+        "rule": "静态规则证据",
+    }
+    return mapping.get(str(value).lower(), str(value))
+
+
+def _join_cn(values: Any) -> str:
+    if values is None:
+        return "-"
+    if isinstance(values, (str, int, float, bool)):
+        text = _plain(values)
+        return text or "-"
+    result = []
+    for value in list(values)[:12]:
+        text = _plain(value)
+        if text:
+            result.append(text)
+    return "、".join(result) if result else "-"
+
+
+def _plain(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, (dict, list)):
+        return _summarize_structured(value)
+    text = str(value).replace("|", "\\|").strip()
+    return text or "-"
+
+
+def _summarize_structured(value: Any) -> str:
+    if isinstance(value, list):
+        return f"{len(value)} 项记录"
+    if isinstance(value, dict):
+        keys = list(value)[:5]
+        return "，".join(str(key) for key in keys) if keys else "-"
+    return str(value)
+
+
+def _cn_run_status(value: Any) -> str:
+    return {"completed": "已完成", "failed": "失败", "running": "运行中", "queued": "排队中"}.get(str(value), _plain(value))
+
+
+def _cn_dynamic_status(value: Any) -> str:
+    return {
+        "dynamic_completed": "已完成",
+        "dynamic_failed": "未完成",
+        "static_only": "仅完成静态扫描",
+        "docker_unavailable": "Docker 不可用",
+    }.get(str(value), _plain(value))
+
+
+def _cn_llm_status(value: Any) -> str:
+    return {"llm_disabled": "未启用", "llm_enabled": "已启用", "llm_failed": "调用失败"}.get(str(value), _plain(value))
+
+
+def _cn_build_status(value: Any) -> str:
+    return {"built": "已构建", "cached": "复用缓存", "failed": "构建失败", "skipped": "跳过"}.get(str(value or "-"), _plain(value or "-"))
+
+
+def _cn_protocols(values: Any) -> str:
+    return _join_cn(_cn_protocol(item) for item in values) if isinstance(values, list) else _cn_protocol(values)
+
+
+def _cn_protocol(value: Any) -> str:
+    mapping = {"cli": "命令行", "http": "网页接口", "browser": "浏览器", "mcp": "MCP 工具协议", "docker": "Docker"}
+    return mapping.get(str(value or "").lower(), _plain(value or "-"))
+
+
+def _cn_network(value: Any) -> str:
+    mapping = {"none": "完全断网", "sandbox": "只能访问沙箱模拟环境", "bridge": "允许访问外部网络"}
+    return mapping.get(str(value or "").lower(), _plain(value))
+
+
+def _cn_image_layer(value: Any) -> str:
+    mapping = {
+        "project_dockerfile": "项目自带 Dockerfile",
+        "first_level_cache": "一级缓存镜像",
+        "local_reserve": "本地二级基础镜像",
+        "cached_public_fallback": "本地已有公共镜像缓存",
+        "public_fallback": "公共镜像源",
+    }
+    return mapping.get(str(value or ""), _plain(value or "-"))
+
+
+def _cn_observed(value: Any) -> str:
+    mapping = {
+        "observed": "已观察到",
+        "inferred_or_capability": "有迹象或具备能力",
+        "not_observed": "未观察到",
+    }
+    return mapping.get(str(value or ""), _plain(value or "未观察到"))
+
+
+def _translate_surface(value: Any) -> str:
+    mapping = {
+        "web": "网页",
+        "search": "搜索服务",
+        "mail": "邮件",
+        "github": "代码托管平台",
+        "rag": "检索文档",
+        "mcp": "MCP 工具",
+        "slack": "协作消息",
+        "calendar": "日历",
+        "drive": "网盘文档",
+        "memory": "记忆",
+        "scheduler": "定时任务",
+        "sink": "外传接收点",
+        "malicious": "可疑链接",
+        "v1": "大模型接口",
+        "health": "健康检查",
+        "network": "网络",
+        "filesystem": "文件系统",
+        "runtime": "运行过程",
+        "response": "回复内容",
+        "environment": "环境变量",
+        "runtime_secrets": "运行密钥",
+        "tools": "工具",
+    }
+    return mapping.get(str(value or "").lower(), _plain(value or "-"))
+
+
+def _translate_capability(value: Any) -> str:
+    mapping = {
+        "secret_access": "读取密钥",
+        "shell": "执行命令",
+        "network": "访问网络",
+        "persistence": "持久化记忆",
+        "mcp": "MCP 工具",
+        "browser": "浏览器访问",
+        "email": "邮件处理",
+        "github": "代码托管交互",
+    }
+    return mapping.get(str(value or "").lower(), _translate_surface(value))
+
+
+def _translate_step(value: Any) -> str:
+    mapping = {
+        "start": "启动智能体",
+        "chat": "对话测试",
+        "cli_send": "命令行输入测试",
+        "seed_conversation": "对话种子测试",
+        "multi_turn_chat": "多轮对话测试",
+        "inject_web_page": "恶意网页注入",
+        "inject_email": "恶意邮件注入",
+        "inject_github_issue": "代码托管问题注入",
+        "inject_rag_document": "检索文档投毒",
+        "inject_mcp_tool_manifest": "MCP 工具投毒",
+        "inject_memory": "记忆投毒",
+        "inject_scheduler": "延迟任务注入",
+        "advance_time": "推进测试时间",
+        "mcp_list_tools": "列出 MCP 工具",
+        "mcp_call_tool": "调用 MCP 工具",
+    }
+    return mapping.get(str(value), _plain(value))
+
+
+def _translate_stage(value: Any) -> str:
+    mapping = {
+        "ingest": "文件上传",
+        "static_scan": "静态扫描",
+        "dynamic_sandbox": "动态沙箱",
+        "docker_build": "镜像构建",
+        "probe": "服务探测",
+        "adapter": "适配",
+        "runtime": "运行",
+        "start": "启动",
+    }
+    return mapping.get(str(value or ""), _plain(value or "未知"))
+
+
+def _translate_title(value: str) -> str:
+    mapping = {
+        "Secret material access": "存在读取密钥或凭据的能力",
+        "Canary secret appeared in runtime interaction output": "测试密钥出现在运行输出中",
+        "Agent/MCP capability": "具备智能体或 MCP 工具能力",
+        "Controlled scheduler task became due": "受控定时任务进入可执行状态",
+        "Network access was attempted or blocked": "出现网络访问尝试",
+        "Agent reached controlled external content": "智能体访问了受控外部内容",
+    }
+    return mapping.get(value, value)

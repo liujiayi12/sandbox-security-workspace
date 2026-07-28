@@ -6,6 +6,7 @@ RUN set -eux; \
       -e 's|http://security.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' \
       /etc/apt/sources.list.d/ubuntu.sources; \
     apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     curl \
     git \
@@ -15,4 +16,7 @@ RUN set -eux; \
     make \
     pkg-config \
     protobuf-compiler \
+    python3 \
+    python3-pip \
+    unzip \
     && rm -rf /var/lib/apt/lists/*

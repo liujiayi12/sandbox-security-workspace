@@ -5,7 +5,9 @@ import subprocess
 
 import pytest
 
+import agent_sandbox.sandbox as sandbox_module
 from agent_sandbox.attack import default_attack_plan
+from agent_sandbox.deployment import BuildResult
 from agent_sandbox.image_reserve import PYTHON_312
 from agent_sandbox.sandbox import _application_failure, _http_probe_urls, docker_available, run_dynamic_sandbox
 from agent_sandbox.static_scan import scan_project
@@ -118,7 +120,7 @@ start: python -c "import os; print('RUNTIME_SECRET=' + os.getenv('TEST_RUNTIME_S
     assert "[runtime-secret-redacted]" in result.run_logs[0]["stdout"]
 
 
-def test_dynamic_runner_tries_next_candidate_after_build_failure(tmp_path: Path) -> None:
+def test_dynamic_runner_tries_next_candidate_after_build_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "agent"
     root.mkdir()
     (root / "requirements.txt").write_text("", encoding="utf-8")
@@ -133,9 +135,32 @@ def test_dynamic_runner_tries_next_candidate_after_build_failure(tmp_path: Path)
     }
     profile.adapter_matches = [bad, *profile.adapter_matches]
 
+    build_calls = []
+
+    def fake_build_environment(_root: Path, build_plan, _build_options):
+        build_calls.append(build_plan)
+        if len(build_calls) == 1:
+            return BuildResult(
+                status="failed",
+                logs=[{"step": "docker_build", "returncode": 7}],
+                failure_stage="docker_build",
+                failure_class="build_script_failed",
+                human_reason="simulated first candidate failure",
+            )
+        return BuildResult(status="built", image="agent-sandbox-build:test", logs=[{"step": "docker_build", "returncode": 0}])
+
+    monkeypatch.setattr(sandbox_module, "docker_available", lambda: (True, None))
+    monkeypatch.setattr(sandbox_module, "build_environment", fake_build_environment)
+    monkeypatch.setattr(
+        sandbox_module,
+        "_run_once",
+        lambda *_args, **_kwargs: {"step": "start", "returncode": 0, "stdout": "second candidate ran\n", "stderr": ""},
+    )
+
     result = run_dynamic_sandbox(root, tmp_path / "workspace", profile, default_attack_plan(findings), cache_policy="rebuild")
 
     assert result.status == "dynamic_completed"
+    assert len(build_calls) >= 2
     assert any(failure.get("adapter") == "bad-candidate" for failure in result.failures)
     assert result.adapter is not None
     assert result.adapter["name"] != "bad-candidate"

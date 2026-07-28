@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import urllib.request
@@ -186,7 +187,7 @@ class SkillToolExecutor:
         }
 
     def _read_file(self, config: dict[str, Any]) -> dict[str, Any]:
-        path = Path(config["path"])
+        path = self._workspace_path(config["path"])
         content = path.read_text(encoding="utf-8")
         sys.stdout.write(content)
         sys.stdout.flush()
@@ -199,7 +200,7 @@ class SkillToolExecutor:
         }
 
     def _write_file(self, config: dict[str, Any]) -> dict[str, Any]:
-        path = Path(config["path"])
+        path = self._workspace_path(config["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if config.get("append") else "w"
         content = config.get("content", "")
@@ -212,6 +213,12 @@ class SkillToolExecutor:
             "stderr": "",
             "path": str(path),
         }
+
+    def _workspace_path(self, value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        return self.skill_root / path
 
     def _run_command(self, config: dict[str, Any]) -> dict[str, Any]:
         shell = bool(config.get("shell", False))
@@ -382,6 +389,7 @@ class LLMAgentSkillRuntime:
             {"role": "user", "content": self._user_prompt()},
         ]
         last_exit_code = 0
+        executed_tools = 0
 
         for step in range(1, max_steps + 1):
             step_id = f"step-{step}"
@@ -410,8 +418,8 @@ class LLMAgentSkillRuntime:
                 if final_message:
                     sys.stdout.write(final_message + "\n")
                     sys.stdout.flush()
-                if not self.definition.actions:
-                    return 0
+                if not self.definition.actions and executed_tools == 0:
+                    return self._fallback_probe(reason=final_message or "LLM finished before executing any tool.")
                 return last_exit_code
 
             result, tool_key, skill_action = self._execute_tool(
@@ -420,6 +428,7 @@ class LLMAgentSkillRuntime:
                 step_id=step_id,
                 parent_event_id=request_event_id,
             )
+            executed_tools += 1
             self.context["actions"][tool_key] = result
             last_exit_code = result["exit_code"]
             observation = json.dumps(
@@ -438,6 +447,59 @@ class LLMAgentSkillRuntime:
                 return result["exit_code"]
 
         return last_exit_code or 1
+
+    def _fallback_probe(self, reason: str) -> int:
+        self._emit("runtime", "fallback_probe", {
+            "reason": reason,
+            "message": "LLM did not execute a tool before finishing; running deterministic sandbox probes.",
+        })
+
+        probes: list[tuple[str, dict[str, Any]]] = [
+            ("read_file", {"path": str(Path(self.definition.skill_root) / self.definition.skill_file)}),
+            ("run_command", {"command": "pwd && find . -maxdepth 3 -type f | sort | head -80", "shell": True}),
+        ]
+
+        url = _first_http_url(self.definition.raw_markdown)
+        if url:
+            probes.append(("http_request", {"url": url, "method": "GET", "timeout_seconds": 8}))
+
+        probes.append((
+            "write_file",
+            {
+                "path": "runtime_output/provloom-fallback-observation.json",
+                "content": json.dumps(
+                    {
+                        "reason": reason,
+                        "skill_name": self.definition.name,
+                        "skill_description": self.definition.description,
+                        "input_payload": self.input_payload,
+                        "note": "Generated because the LLM runtime finished without executing any tool.",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            },
+        ))
+
+        saw_success = False
+        last_exit_code = 0
+        for index, (tool_id, arguments) in enumerate(probes, start=1):
+            step_id = f"fallback-{index}"
+            try:
+                result, tool_key, _skill_action = self._execute_tool(tool_id, arguments, step_id=step_id)
+            except Exception as exc:
+                self._emit("runtime", "fallback_probe_error", {
+                    "tool": tool_id,
+                    "error": str(exc),
+                }, step_id=step_id)
+                continue
+            self.context["actions"][tool_key] = result
+            if result["exit_code"] == 0:
+                saw_success = True
+            else:
+                last_exit_code = result["exit_code"]
+
+        return 0 if saw_success else last_exit_code or 1
 
     def _find_action(self, tool_id: str) -> SkillAction | None:
         for action in self.definition.actions:
@@ -554,6 +616,15 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     if start == -1 or end == -1 or end <= start:
         raise RuntimeError(f"LLM response is not valid JSON: {text}")
     return json.loads(candidate[start:end + 1])
+
+
+def _first_http_url(text: str) -> str:
+    for match in re.finditer(r"https?://[^\s)>\]\"']+", text):
+        url = match.group(0).rstrip(".,;:")
+        host = urlparse(url).hostname or ""
+        if host:
+            return url
+    return ""
 
 
 def main() -> int:

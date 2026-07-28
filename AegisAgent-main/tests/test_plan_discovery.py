@@ -65,7 +65,7 @@ def test_shebang_shell_cli_generates_chat_capable_plan(tmp_path: Path) -> None:
     assert "SANDBOX_CLI_INPUT" in shell_plan["start"]
 
 
-def test_llm_plan_expands_to_image_reserve_variants() -> None:
+def test_llm_plan_keeps_single_concise_candidate_before_feedback() -> None:
     candidate = llm_plan_to_candidate(
         {
             "name": "bash-cli",
@@ -82,7 +82,7 @@ def test_llm_plan_expands_to_image_reserve_variants() -> None:
     assert candidate is not None
     variants = expand_candidate_variants(candidate)
 
-    assert any(item.image == "bash:5.2" for item in variants)
+    assert variants == [candidate]
 
 
 def test_llm_plan_prefers_local_shell_reserve_and_rewrites_apt_for_bash_image(tmp_path: Path) -> None:
@@ -105,20 +105,12 @@ def test_llm_plan_prefers_local_shell_reserve_and_rewrites_apt_for_bash_image(tm
         assert plan.install_commands == ["apk add --no-cache jq curl ca-certificates"]
 
 
-def test_shell_reserve_variant_rewrites_apk_for_debian_style_image(tmp_path: Path) -> None:
+def test_shell_candidate_is_not_preexpanded_to_universal_image(tmp_path: Path) -> None:
     script = tmp_path / "agent"
     script.write_text("#!/usr/bin/env bash\njq --version\ncurl --version\n", encoding="utf-8")
     profile, _, _ = scan_project(tmp_path)
-    variant = next(item for item in profile.adapter_matches if item["image"] == "aegisagent-universal:linux")
 
-    from agent_sandbox.adapters import candidate_from_dict
-
-    plan = create_build_plan(tmp_path, candidate_from_dict(variant), BuildOptions())
-
-    if not plan.base_image.startswith("bash:"):
-        assert plan.install_commands == [
-            "apt-get update && apt-get install -y --no-install-recommends ca-certificates jq curl"
-        ]
+    assert not any(item["image"] == "aegisagent-universal:linux" for item in profile.adapter_matches)
 
 
 def test_node_commander_ask_command_is_ranked_before_interactive_start(tmp_path: Path) -> None:
@@ -450,7 +442,7 @@ def test_docs_maintenance_scripts_are_not_start_candidates(tmp_path: Path) -> No
     assert any("npm run dev" in item["start"] for item in profile.adapter_matches)
 
 
-def test_node_lockfile_relaxed_variant_is_preserved() -> None:
+def test_node_lockfile_relaxation_is_not_preexpanded_before_feedback() -> None:
     candidate = AdapterCandidate(
         name="node-http",
         kind="plan_node",
@@ -466,7 +458,7 @@ def test_node_lockfile_relaxed_variant_is_preserved() -> None:
 
     variants = expand_candidate_variants(candidate)
 
-    assert any(item.name.endswith(":relaxed-lockfile") and "bun install --ignore-scripts" in item.install for item in variants)
+    assert variants == [candidate]
 
 
 def test_node_workspace_uses_declared_package_manager_for_build(tmp_path: Path) -> None:
