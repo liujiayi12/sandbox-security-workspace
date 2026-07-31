@@ -758,7 +758,7 @@ function AuthPage({ onAuthenticated }) {
             <ShieldCheck size={25} />
           </div>
           <div>
-            <strong>Sandbox Console</strong>
+            <strong>ASGuard</strong>
             <span>Skill 与 Agent 安全检测</span>
           </div>
         </div>
@@ -1362,16 +1362,290 @@ function SkillRiskDashboard({ result }) {
       </div>
 
       {result.batch ? <SkillBatchSummary results={batchItems} /> : null}
+      <SkillFlowGraph result={result} />
       <EvidenceSpotlight behaviors={behaviors} timeline={timeline} />
-      <ExpandableDetail title="完整检测明细" className="risk-detail-panel">
-        <SkillMarkdownReport result={result} />
-        <details className="json-preview">
-          <summary>原始 JSON 数据</summary>
-          <pre>{JSON.stringify(result, null, 2)}</pre>
-        </details>
-      </ExpandableDetail>
+      <SkillReportPages result={result} />
     </div>
   );
+}
+
+
+function SkillFlowGraph({ result }) {
+  const graph = buildSkillFlowGraph(result);
+  const [selectedId, setSelectedId] = useState(graph.nodes.find((node) => node.details.length)?.id || graph.nodes[0]?.id);
+  const selected = graph.nodes.find((node) => node.id === selectedId) || graph.nodes[0];
+  const hasDetails = selected && selected.details.length > 0;
+
+  return (
+    <section className="skill-flow-graph compact">
+      <div className="skill-flow-head">
+        <div className="mini-section-title">
+          <Route size={16} />
+          <strong>Skill 行为链路图</strong>
+        </div>
+        <div className="skill-flow-actions">
+          <p>{graph.summary}</p>
+        </div>
+      </div>
+      <SkillFlowMap graph={graph} selectedId={selectedId} onSelect={setSelectedId} />
+      {hasDetails ? (
+        <div className="skill-flow-detail">
+          <div>
+            <strong>{selected.label}</strong>
+            <span>{selected.detail}</span>
+          </div>
+          <ol>
+            {selected.details.map((item, index) => (
+              <li key={`${selected.id}-${index}`}>
+                <strong>{item.title || `明细 ${index + 1}`}</strong>
+                {item.text ? <p>{item.text}</p> : null}
+                {item.raw !== undefined ? <pre>{typeof item.raw === "string" ? item.raw : JSON.stringify(item.raw, null, 2)}</pre> : null}
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+
+function SkillFlowMap({ graph, selectedId, onSelect }) {
+  const center = graph.nodes.find((node) => node.id === "risk") || graph.nodes[graph.nodes.length - 1];
+  const satellites = graph.nodes.filter((node) => node.id !== center.id);
+  const CenterIcon = center.icon;
+
+  return (
+    <div className="skill-flow-map" aria-label="Skill 行为链路图">
+      <button
+        type="button"
+        className={cx("skill-flow-center", center.tone, selectedId === center.id && "active")}
+        onClick={() => onSelect(center.id)}
+      >
+        <span><CenterIcon size={28} /></span>
+        <strong>{center.value}</strong>
+        <em>{center.label}</em>
+        <small>{center.caption}</small>
+      </button>
+      <div className="skill-flow-ring">
+        {satellites.map((node) => {
+          const Icon = node.icon;
+          return (
+            <button
+              type="button"
+              className={cx("skill-flow-node", node.tone, selectedId === node.id && "active")}
+              onClick={() => onSelect(node.id)}
+              key={node.id}
+            >
+              <span className="skill-flow-icon"><Icon size={18} /></span>
+              <span className="skill-flow-copy">
+                <strong>{node.label}</strong>
+                <em>{node.value}</em>
+                <small>{node.caption}</small>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+function SkillReportPages({ result }) {
+  const [active, setActive] = useState("report");
+  return (
+    <section className="risk-detail-panel report-pages">
+      <div className="report-pages-head">
+        <strong>检测结果</strong>
+        <div className="report-tabs" role="tablist" aria-label="检测结果视图">
+          <button type="button" className={cx(active === "report" && "active")} onClick={() => setActive("report")}>报告</button>
+          <button type="button" className={cx(active === "json" && "active")} onClick={() => setActive("json")}>原始 JSON</button>
+        </div>
+      </div>
+      <div className="report-page-body">
+        {active === "report" ? (
+          <SkillMarkdownReport result={result} />
+        ) : (
+          <div className="json-preview open-json">
+            <pre>{JSON.stringify(result, null, 2)}</pre>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+
+function buildSkillFlowGraph(result) {
+  const items = Array.isArray(result?.skillResults) && result.skillResults.length ? result.skillResults : result ? [result] : [];
+  const allFileEvents = collectSkillEvents(items, "fileEvents");
+  const allProcessEvents = collectSkillEvents(items, "processEvents");
+  const allToolCalls = collectSkillEvents(items, "toolCalls");
+  const allNetworkEvents = collectSkillEvents(items, "networkEvents");
+  const allLlmEvents = collectSkillEvents(items, "llmEvents");
+  const allTimeline = collectSkillEvents(items, "evidenceTimeline");
+  const behaviors = collectSkillEvents(items, "detectedBehaviors");
+  const riskTone = getSkillRiskTone(result);
+  const { total, completed, failed } = getSkillRunStats(result);
+  const sampleNames = items.map((item) => item.skillName || item.skillFile || item.skillPath || "Skill").slice(0, 4);
+  const runtimeNames = uniqueCompact(items.map((item) => item.runtimeName || item.sandboxImage || item.networkPolicy));
+  const processToolCount = allProcessEvents.length + allToolCalls.length;
+  const networkLlmCount = allNetworkEvents.length + allLlmEvents.length;
+
+  const summaryParts = [
+    `${completed}/${total} 个 Skill 完成`,
+    `${allFileEvents.length} 条文件行为`,
+    `${processToolCount} 条进程/工具行为`,
+    `${networkLlmCount} 条网络/LLM 行为`,
+  ];
+  if (failed) summaryParts.push(`${failed} 个未完成`);
+
+  return {
+    summary: summaryParts.join("，"),
+    nodes: [
+      {
+        id: "input",
+        label: "输入样本",
+        value: total > 1 ? `${total} 个 Skill` : sampleNames[0] || "Skill",
+        caption: "上传内容",
+        detail: "本次进入沙箱检测的 Skill 样本。",
+        icon: FileArchive,
+        tone: "info",
+        details: buildInputFlowDetails(items),
+      },
+      {
+        id: "sandbox",
+        label: "沙箱执行",
+        value: failed ? "部分未完成" : "执行完成",
+        caption: runtimeNames[0] || result?.networkPolicy || "Docker 隔离",
+        detail: failed ? "部分样本没有完整执行，建议先查看未完成原因。" : "样本已完成沙箱运行，并返回可视化证据。",
+        icon: TerminalSquare,
+        tone: failed ? "warning" : "good",
+        details: buildEventFlowDetails(allTimeline, "执行事件", formatTimelineText),
+      },
+      {
+        id: "files",
+        label: "文件行为",
+        value: `${allFileEvents.length} 条`,
+        caption: allFileEvents.length ? "读写/访问" : "暂无命中",
+        detail: "沙箱记录到的文件访问、读写或路径相关行为。",
+        icon: FileSearch,
+        tone: allFileEvents.length ? "warning" : "muted",
+        details: buildEventFlowDetails(allFileEvents, "文件事件", formatFlowEvent),
+      },
+      {
+        id: "process",
+        label: "进程与工具",
+        value: `${processToolCount} 条`,
+        caption: allToolCalls.length ? "工具调用" : "进程线索",
+        detail: "沙箱记录到的进程启动、命令执行或工具调用链路。",
+        icon: Activity,
+        tone: processToolCount ? "warning" : "muted",
+        details: buildEventFlowDetails([...allProcessEvents, ...allToolCalls], "进程/工具事件", formatFlowEvent),
+      },
+      {
+        id: "network",
+        label: "网络与 LLM",
+        value: `${networkLlmCount} 条`,
+        caption: allNetworkEvents.length ? "外联线索" : allLlmEvents.length ? "LLM 事件" : "暂无命中",
+        detail: "沙箱记录到的网络请求、域名访问或 LLM 相关事件。",
+        icon: Network,
+        tone: networkLlmCount ? "danger" : "muted",
+        details: buildEventFlowDetails([...allNetworkEvents, ...allLlmEvents], "网络/LLM 事件", formatFlowEvent),
+      },
+      {
+        id: "risk",
+        label: "风险结论",
+        value: result?.riskLevelName || result?.riskLevel || "未知",
+        caption: `${Number(result?.riskScore || 0)} 分 / ${behaviors.length} 个行为`,
+        detail: result?.riskSummary || "请结合风险评分、命中行为和链路证据进行复核。",
+        icon: riskTone === "good" ? ShieldCheck : riskTone === "danger" ? ShieldAlert : ShieldQuestion,
+        tone: riskTone,
+        details: buildRiskFlowDetails(result, behaviors),
+      },
+    ],
+  };
+}
+
+
+function collectSkillEvents(items, key) {
+  return items.flatMap((item) => Array.isArray(item?.[key]) ? item[key] : []);
+}
+
+
+function uniqueCompact(items) {
+  return [...new Set(items.filter(Boolean).map((item) => String(item)))];
+}
+
+
+function buildInputFlowDetails(items) {
+  return items.map((item, index) => ({
+    title: item?.skillName || item?.skillFile || `Skill ${index + 1}`,
+    text: [
+      item?.skillPath ? `路径：${item.skillPath}` : "",
+      item?.executionStatus ? `执行状态：${item.executionStatus}` : "",
+      item?.riskLevelName || item?.riskLevel ? `风险等级：${item.riskLevelName || item.riskLevel}` : "",
+      Number.isFinite(Number(item?.riskScore)) ? `风险评分：${Number(item.riskScore)}` : "",
+    ].filter(Boolean).join("；"),
+    raw: {
+      skillName: item?.skillName,
+      skillFile: item?.skillFile,
+      skillPath: item?.skillPath,
+      executionStatus: item?.executionStatus,
+      riskScore: item?.riskScore,
+      riskLevel: item?.riskLevel,
+      riskLevelName: item?.riskLevelName,
+    },
+  }));
+}
+
+
+function buildEventFlowDetails(items, titlePrefix, formatter) {
+  return items.map((item, index) => ({
+    title: `${titlePrefix} ${index + 1}`,
+    text: formatter(item),
+    raw: item,
+  }));
+}
+
+
+function buildRiskFlowDetails(result, behaviors) {
+  const details = [];
+  if (result?.riskSummary || result?.riskLevel || result?.riskLevelName || result?.riskScore !== undefined) {
+    details.push({
+      title: "风险结论",
+      text: result?.riskSummary || "检测已完成，请结合证据进行人工复核。",
+      raw: {
+        riskScore: result?.riskScore,
+        riskLevel: result?.riskLevel,
+        riskLevelName: result?.riskLevelName,
+        primaryRisk: result?.primaryRisk,
+        riskLabels: result?.riskLabels,
+        finalDecision: result?.finalDecision,
+        rootCause: result?.rootCause,
+        rootCauseDetail: result?.rootCauseDetail,
+      },
+    });
+  }
+  behaviors.forEach((item, index) => {
+    details.push({
+      title: `命中行为 ${index + 1}`,
+      text: formatEvidenceText(item),
+      raw: item,
+    });
+  });
+  return details;
+}
+
+
+function formatFlowEvent(item) {
+  if (typeof item === "string") return humanizeEvidenceKey(item);
+  if (!item || typeof item !== "object") return String(item ?? "");
+  const label = item.label || item.description || item.summary || item.action || item.type || item.name || item.tool || item.command || item.method;
+  const target = item.path || item.file || item.url || item.host || item.domain || item.target || item.destination || item.args;
+  const status = item.status || item.result || item.exitCode;
+  return [label, target, status].filter((part) => part !== undefined && part !== null && String(part).trim()).map((part) => String(part)).join(" · ");
 }
 
 
@@ -1858,10 +2132,10 @@ function normalizeDynamicStatus(value) {
 
 function App() {
   const [activePage, setActivePage] = useState("overview");
-  const [token, setToken] = useState(() => sessionStorage.getItem("sandbox_console_token") || "");
+  const [token, setToken] = useState(() => sessionStorage.getItem("asguard_console_token") || sessionStorage.getItem("sandbox_console_token") || "");
   const [user, setUser] = useState(() => {
     try {
-      return JSON.parse(sessionStorage.getItem("sandbox_console_user") || "null");
+      return JSON.parse(sessionStorage.getItem("asguard_console_user") || sessionStorage.getItem("sandbox_console_user") || "null");
     } catch {
       return null;
     }
@@ -1873,14 +2147,18 @@ function App() {
     const nextUser = data?.user || null;
     setToken(nextToken);
     setUser(nextUser);
-    sessionStorage.setItem("sandbox_console_token", nextToken);
-    sessionStorage.setItem("sandbox_console_user", JSON.stringify(nextUser));
+    sessionStorage.setItem("asguard_console_token", nextToken);
+    sessionStorage.setItem("asguard_console_user", JSON.stringify(nextUser));
+    sessionStorage.removeItem("sandbox_console_token");
+    sessionStorage.removeItem("sandbox_console_user");
   };
 
   const logout = () => {
     setToken("");
     setUser(null);
     setActivePage("overview");
+    sessionStorage.removeItem("asguard_console_token");
+    sessionStorage.removeItem("asguard_console_user");
     sessionStorage.removeItem("sandbox_console_token");
     sessionStorage.removeItem("sandbox_console_user");
   };
@@ -1910,7 +2188,7 @@ function App() {
             <ShieldCheck size={25} />
           </div>
           <div>
-            <strong>Sandbox Console</strong>
+            <strong>ASGuard</strong>
             <span>Skill 与 Agent 安全检测</span>
           </div>
         </div>

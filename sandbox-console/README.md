@@ -1,4 +1,4 @@
-# Sandbox Console
+# ASGuard
 
 Independent frontend for two local security services:
 

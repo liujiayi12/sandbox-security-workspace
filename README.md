@@ -1,29 +1,32 @@
 # Sandbox Security Workspace
 
-Sandbox Security Workspace 是一个面向 Skill 与 Agent 的双沙箱安全检测平台。项目提供独立前端控制台，并接入两个本地沙箱后端，用于对 Skill 包和 Agent 项目进行动态执行、行为观测、风险评估与报告展示。
+Sandbox Security Workspace 是一个面向 Skill 与 Agent 的本地安全沙箱工作区。项目提供独立前端控制台，并接入两个本地后端：Skill 动态沙箱和 Agent 安全分析沙箱，用于对 Skill 包、Agent 项目进行隔离执行、行为观测、风险评估和报告展示。
 
 ## 项目定位
 
-该项目适用于以下场景：
+本项目适用于以下场景：
 
 - 对待上线的 Skill 进行动态安全检测
-- 对 Agent 项目进行隔离运行和风险分析
-- 在本地环境中观察文件、进程、网络和工具调用行为
+- 对 Agent 项目进行隔离运行、静态扫描和风险分析
+- 在本地环境中观察文件、进程、网络、工具调用和 LLM 相关行为
 - 为安全评审、供应链治理和能力上线审核提供可复核证据
 
 ## 核心功能
 
-### Skill 动态检测
+### Skill 动态沙箱
 
 基于 `clawguard-main` 中的 ProvLoom 动态沙箱能力，支持上传 `SKILL.md`、相关文件或 zip 包，在 Docker 隔离环境中执行并生成检测结果。
 
 主要能力：
 
-- Skill 文件上传与远程 URL 输入
-- 标准检测、隔离检测、快速检测三种策略
-- 文件、进程、网络、工具调用行为观测
-- 风险评分、行为证据、执行时间线展示
-- 可选 LLM 辅助解释
+- Skill 文件上传、zip 包上传和远程 URL 输入
+- 标准检测、隔离检测、快速检测等策略
+- 文件、进程、网络、工具调用和 LLM 事件观测
+- 风险评分、风险等级、行为证据和执行时间线展示
+- 自动生成 Markdown 检测报告，并保留原始 JSON 明细
+- 对没有可执行动作定义的 Skill 自动降级为静态能力画像分析
+- 批量检测时汇总最高风险结果和每个 Skill 的独立结论
+- 运行失败时输出可读的未完成原因，便于区分环境问题和样本风险
 
 ### Agent 安全分析
 
@@ -35,11 +38,11 @@ Sandbox Security Workspace 是一个面向 Skill 与 Agent 的双沙箱安全检
 - 自动识别依赖、启动方式和构建线索
 - Docker 沙箱动态运行
 - 攻击探针与风险证据采集
-- 运行事件轮询与最终报告展示
+- 运行事件轮询和最终报告展示
 
 ### 独立前端控制台
 
-`sandbox-console` 是独立于 `clawguard-main/web` 的 React/Vite 前端，仅保留本项目需要的两个功能入口。
+`sandbox-console` 是独立于 `clawguard-main/web` 的 React/Vite 前端，只保留本工作区需要的两个功能入口。
 
 界面包含：
 
@@ -48,6 +51,7 @@ Sandbox Security Workspace 是一个面向 Skill 与 Agent 的双沙箱安全检
 - Skill 检测工作台
 - Agent 分析工作台
 - 服务在线状态展示
+- Markdown 报告渲染与原始 JSON 展开查看
 - 用户友好的上传、策略选择和结果展示流程
 
 ## 项目结构
@@ -62,6 +66,14 @@ Sandbox Security Workspace 是一个面向 Skill 与 Agent 的双沙箱安全检
 ├── start-skill-dynamic-api.ps1   # 启动 Skill 动态沙箱 API
 └── README.md
 ```
+
+本地运行时还可能生成以下目录，这些目录不需要提交到 Git：
+
+- `runtime-cache/`
+- `node_modules/`
+- `.venv/`
+- `.env`
+- 构建产物、日志和本地数据库文件
 
 ## 本地运行
 
@@ -89,6 +101,14 @@ http://127.0.0.1:8000
 http://127.0.0.1:8787
 ```
 
+当前启动脚本默认设置：
+
+```powershell
+$env:PROVLOOM_REBUILD_SANDBOX_IMAGE = "0"
+```
+
+这表示启动 API 时不会每次自动重建沙箱镜像。首次运行或镜像变更后，请手动构建镜像，或临时改为 `"1"` 后再启动。
+
 ### 3. 启动前端控制台
 
 ```powershell
@@ -109,8 +129,6 @@ http://127.0.0.1:5174
 docker run --rm hello-world
 ```
 
-如果 Docker Hub 网络不稳定，可以使用国内镜像源预拉取基础镜像。
-
 Skill 动态沙箱镜像可提前构建：
 
 ```powershell
@@ -119,11 +137,13 @@ $env:DOCKER_BUILDKIT=0
 docker build --pull=false -t skill-runtime-sandbox:latest -f docker/sandbox/Dockerfile .
 ```
 
+如果 Docker Hub 网络不稳定，可以先配置镜像源，或预拉取项目需要的基础镜像。
+
 ## LLM 配置
 
-LLM 能力为可选项。
+LLM 能力是可选项：
 
-- 不配置 LLM Key：仍可进行基础沙箱检测和规则分析
+- 不配置 LLM Key：仍可进行基础沙箱检测、规则分析和静态画像分析
 - 配置 LLM Key：可启用辅助解释、触发规划和更丰富的风险分析
 
 请勿将真实 API Key 提交到仓库。需要本地配置时，请使用 `.env` 或页面中的临时输入。
@@ -155,4 +175,6 @@ LLM 能力为可选项。
 - 已完成 Skill 动态检测入口
 - 已完成 Agent 沙箱分析入口
 - 已完成 Docker 动态执行环境适配
+- 已支持 Skill Markdown 报告展示和原始 JSON 明细查看
+- 已支持无动作 Skill 的静态降级分析
 - 后续可继续接入统一登录、任务历史、报告导出和团队权限管理
